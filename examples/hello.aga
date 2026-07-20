@@ -1,0 +1,6 @@
+fn main() {
+    print("Hello from AgamaLang!");
+    print("\r\nThis is a mid-level language.");
+    print("\r\n");
+    println("It compiles directly to machine code!");
+}

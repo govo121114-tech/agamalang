@@ -1,0 +1,7 @@
+[package]
+name = "agamalang"
+version = "0.1.0"
+edition = "2021"
+description = "AgamaLang - mid-level compiled programming language"
+
+[dependencies]

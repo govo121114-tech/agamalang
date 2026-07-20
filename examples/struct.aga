@@ -1,0 +1,51 @@
+struct Token {
+    kind: int;
+    line: int;
+    column: int;
+}
+
+fn main() {
+    // 1. Struct init + member read
+    let t: Token = Token {
+        kind: 42;
+        line: 10;
+        column: 30;
+    };
+
+    let k: int = t.kind;
+    if (k == 42) {
+        println("kind OK");
+    } else {
+        return;
+    }
+
+    let l: int = t.line;
+    if (l == 10) {
+        println("line OK");
+    }
+
+    let c: int = t.column;
+    if (c == 30) {
+        println("column OK");
+    }
+
+    // 2. Struct init with different values
+    let t2: Token = Token {
+        kind: 100;
+        line: 200;
+        column: 300;
+    };
+
+    let k2: int = t2.kind;
+    if (k2 == 100) {
+        println("struct init OK");
+    }
+
+    // 3. sizeof
+    let sz: int = sizeof(Token);
+    if (sz == 12) {
+        println("sizeof OK");
+    }
+
+    println("ALL DONE");
+}

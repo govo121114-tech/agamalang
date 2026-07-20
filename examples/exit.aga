@@ -1,0 +1,3 @@
+fn main() {
+    // Just exit - should call ExitProcess(0)
+}

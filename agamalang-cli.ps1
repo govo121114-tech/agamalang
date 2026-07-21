@@ -77,7 +77,9 @@ function Build-Aga {
   }
 
   Step "Compiling: $SrcFile" Cyan
+  Push-Location -LiteralPath $ProjectRoot
   $output = & $CargoExe run -- $SrcFile $OutName 2>&1
+  Pop-Location
   $lastLine = $output | Select-Object -Last 1
 
   if ($LASTEXITCODE -ne 0) {
@@ -178,7 +180,9 @@ function Do-Test {
     Write-Host -NoNewline "  $($ex.Name) ... " -ForegroundColor Cyan
 
     # Compile
+    Push-Location -LiteralPath $ProjectRoot
     $output = & $CargoExe run -- $ex.FullName 2>&1
+    Pop-Location
     if ($LASTEXITCODE -ne 0) {
       Write-Host "COMPILE FAIL" -ForegroundColor Red
       $failed++

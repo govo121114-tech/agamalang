@@ -999,14 +999,30 @@ impl Generator {
 
     fn compile_print(&mut self, callee: &str, args: &[Expr]) {
         if args.is_empty() { return; }
-        let s = match &args[0] {
-            Expr::String(s) => format!("{}{}", s, if callee == "println" { "\r\n" } else { "" }),
-            Expr::Integer(n) => format!("{}{}", n, if callee == "println" { "\r\n" } else { "" }),
-            Expr::Bool(b) => format!("{}{}", if *b { "true" } else { "false" }, if callee == "println" { "\r\n" } else { "" }),
-            _ => String::new(),
-        };
+        match &args[0] {
+            Expr::String(s) => {
+                let s = format!("{}{}", s, if callee == "println" { "\r\n" } else { "" });
+                self.emit_print_string(&s);
+            },
+            Expr::Integer(n) => {
+                let s = format!("{}{}", n, if callee == "println" { "\r\n" } else { "" });
+                self.emit_print_string(&s);
+            },
+            Expr::Bool(b) => {
+                let s = format!("{}{}", if *b { "true" } else { "false" }, if callee == "println" { "\r\n" } else { "" });
+                self.emit_print_string(&s);
+            },
+            _ => {
+                // Runtime: evaluate expression, convert int to string, print
+                self.compile_expr_to(&args[0], 0);  // RAX = value (32-bit, zero-extended)
+                self.emit_print_int(callee == "println");
+            },
+        }
+    }
 
-        let str_idx = self.intern_string(&s);
+    /// Print a compile-time-known string (interned in .data rdata section)
+    fn emit_print_string(&mut self, s: &str) {
+        let str_idx = self.intern_string(s);
         let str_len = s.len() as i32;
 
         // Align stack to 16 bytes before call (after prologue RSP ≡ 8 mod 16, sub 0x28 → RSP ≡ 0)
@@ -1027,6 +1043,85 @@ impl Generator {
         self.mov_m64_imm32(4, 0x20, 0);        // Overlapped = NULL (5th arg at [RSP+0x20])
         self.emit_import_call("WriteFile");
         self.add_rm64_imm8(4, 0x38);
+    }
+
+    /// Print a runtime integer value (already in RAX).
+    /// Converts to decimal string on stack, then calls GetStdHandle + WriteFile.
+    fn emit_print_int(&mut self, add_newline: bool) {
+        // Save callee-saved registers we'll use
+        self.push_r64(3);   // RBX
+        self.push_r64(7);   // RDI
+
+        // Allocate 32-byte buffer for decimal digits (max ~10 for 32-bit int)
+        self.sub_rm64_imm8(4, 32);
+
+        // lea r8, [rsp+32] — end of buffer, we write digits backwards
+        self.lea_r64(8, 4, 32);
+
+        // === itoa loop ===
+        let loop_lbl = self.new_label();
+        self.put_label(loop_lbl);
+
+        // xor edx, edx — clear high part for div
+        self.xor_r64(2, 2);
+        // mov ecx, 10 — divisor
+        self.mov_r64_imm32(1, 10);
+        // div ecx — unsigned divide EDX:EAX by ECX → EAX=quotient, EDX=remainder
+        self.u8(0xF7); self.u8(0xF1);        // F7 F1 = div ecx
+        // add dl, '0' — convert digit to ASCII
+        self.u8(0x80); self.u8(0xC2); self.u8(0x30);  // 80 C2 30
+        // dec r8 — move write pointer backwards
+        self.u8(0x49); self.u8(0xFF); self.u8(0xC8);  // 49 FF C8 = dec r8
+        // mov byte [r8], dl — store digit byte
+        self.u8(0x41); self.u8(0x88); self.u8(0x10);  // 41 88 10 = mov [r8], dl
+
+        // test eax, eax
+        self.u8(0x85); self.u8(0xC0);        // 85 C0 = test eax,eax
+        // jnz loop
+        self.jcc_rel32(CC_NE);
+        self.add_label_fixup(self.asm.len() as u32 - 4, loop_lbl, true);
+
+        // === After loop: R8 = pointer to first digit ===
+        self.mov_r64_r64(3, 8);    // RBX = string pointer
+
+        // Length = (RSP + 32) - RBX
+        self.lea_r64(0, 4, 32);    // RAX = RSP + 32
+        self.sub_r64(0, 3);        // RAX -= RBX
+        self.mov_r64_r64(7, 0);    // RDI = length
+
+        if add_newline {
+            // Append \r\n at end of string
+            self.mov_r64_r64(0, 3);   // RAX = RBX (string)
+            self.add_r64(0, 7);       // RAX += RDI (→ after last digit)
+            // mov byte [rax], 0x0D  (\r)
+            self.u8(0xC6); self.u8(0x00); self.u8(0x0D);
+            // mov byte [rax+1], 0x0A  (\n)
+            self.u8(0xC6); self.u8(0x40); self.u8(0x01); self.u8(0x0A);
+            // length += 2
+            self.add_rm64_imm8(7, 2);
+        }
+
+        // === GetStdHandle(STD_OUTPUT_HANDLE) ===
+        self.sub_rm64_imm8(4, 0x28);
+        self.mov_r64_imm32(1, 0xFFFFFFF5u32);
+        self.emit_import_call("GetStdHandle");
+        self.add_rm64_imm8(4, 0x28);
+
+        // === WriteFile(handle, string, length, &written, NULL) ===
+        self.mov_r64_r64(1, 0);   // RCX = handle
+        self.mov_r64_r64(2, 3);   // RDX = string (from RBX)
+        self.mov_r64_r64(8, 7);   // R8 = length (from RDI)
+
+        self.sub_rm64_imm8(4, 0x38);
+        self.lea_r64(9, 4, 0x30);          // R9 = &written
+        self.mov_m64_imm32(4, 0x20, 0);    // overlapped = NULL
+        self.emit_import_call("WriteFile");
+        self.add_rm64_imm8(4, 0x38);
+
+        // === Restore ===
+        self.add_rm64_imm8(4, 32);  // free buffer
+        self.pop_r64(7);            // RDI
+        self.pop_r64(3);            // RBX
     }
 
     fn emit_import_call(&mut self, name: &str) {

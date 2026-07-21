@@ -1,0 +1,17 @@
+// Print variables
+fn main() {
+    let x: int = 42;
+    let y: int = 12345;
+    let z: int = 0;
+    println("x = ");
+    println(x);
+
+    print("y = ");
+    println(y);
+
+    print("z = ");
+    println(z);
+
+    print("x + y = ");
+    println(x + y);
+}

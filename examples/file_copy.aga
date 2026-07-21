@@ -1,0 +1,16 @@
+fn main() {
+    let data: *int = read_file("examples\\exit.aga");
+
+    if (data == null) {
+        println("FAIL");
+        return;
+    }
+
+    println("OK");
+
+    let size: int = *(data - 4);
+
+    write_file("exit_copy.aga", data, size);
+
+    println("DONE");
+}

@@ -20,10 +20,12 @@ pub struct CompiledUnit {
     pub import_relocs: Vec<(u32, String)>, // (code_offset, function_name)
 }
 
-/// Compute the size of a type for stack allocation (all fields = 4 bytes for simplicity)
+/// Compute the size of a type for layout (4 for int/char/bool, 8 for pointers)
 fn type_size(ty: &Type) -> i32 {
     match ty {
-        Type::Int | Type::Char | Type::Bool | Type::Ptr(_) | Type::Array(_) => 4,
+        Type::Int | Type::Char | Type::Bool => 4,
+        Type::Ptr(_) => 8,
+        Type::Array(_) => 8, // pointer to array (or array descriptor)
         Type::Void => 0,
         Type::StaticArray(elem, n) => type_size(elem) * (*n as i32),
         Type::Named(name) => 4, // placeholder; struct layout has actual size
@@ -42,6 +44,29 @@ fn field_offset(name: &str, field: &str, layouts: &HashMap<String, StructLayout>
         .map(|f| f.offset)
 }
 
+fn field_size(name: &str, field: &str, layouts: &HashMap<String, StructLayout>) -> Option<i32> {
+    layouts.get(name)
+        .and_then(|l| l.fields.iter().find(|f| f.name == field))
+        .map(|f| f.size)
+}
+
+/// Get field size from a Member expression for correct-width store
+fn get_member_field_size(
+    var_types: &HashMap<String, Type>,
+    layouts: &HashMap<String, StructLayout>,
+    object: &Expr,
+    member: &str,
+) -> i32 {
+    if let Expr::Identifier(obj_name) = object {
+        if let Some(ty) = var_types.get(obj_name) {
+            if let Type::Named(struct_name) = ty {
+                return field_size(struct_name, member, layouts).unwrap_or(8);
+            }
+        }
+    }
+    8
+}
+
 /// Compile a program and return the compiled unit
 pub fn compile(program: &Program) -> CompiledUnit {
     let mut gen = Generator::new();
@@ -50,11 +75,13 @@ pub fn compile(program: &Program) -> CompiledUnit {
         let mut fields = Vec::new();
         let mut offset: i32 = 0;
         for (fname, ftype) in &sd.fields {
+            let fsz = type_size(&ftype);
             fields.push(StructField {
                 name: fname.clone(),
                 offset,
+                size: fsz,
             });
-            offset += type_size(&ftype);
+            offset += fsz;
         }
         gen.struct_layouts.insert(sd.name.clone(), StructLayout {
             size: offset,
@@ -69,6 +96,7 @@ pub fn compile(program: &Program) -> CompiledUnit {
 struct StructField {
     name: String,
     offset: i32,
+    size: i32,
 }
 
 #[derive(Clone)]
@@ -215,8 +243,21 @@ impl Generator {
         self.encode_addr(dst, base, off);
     }
 
+    fn mov_r64_m32(&mut self, dst: u8, base: u8, off: i32) {
+        self.rex(false, dst >= 8, false, base >= 8); // 32-bit load, zero-extends
+        self.u8(0x8B);
+        self.encode_addr(dst, base, off);
+    }
+
     fn mov_m64_r64(&mut self, base: u8, off: i32, src: u8) {
         self.rex(true, src >= 8, false, base >= 8);
+        self.u8(0x89);
+        self.encode_addr(src, base, off);
+    }
+
+    fn mov_m32_r64(&mut self, base: u8, off: i32, src: u8) {
+        // 32-bit store: mov [base+off], src32 (no REX.W)
+        self.rex(false, src >= 8, false, base >= 8);
         self.u8(0x89);
         self.encode_addr(src, base, off);
     }
@@ -340,6 +381,13 @@ impl Generator {
         self.modrm(3, 0, r & 7);
     }
 
+    /// movzx r32, r8 — zero-extend a byte register to 32-bit (which also zero-extends to 64-bit)
+    fn movzx_r32_r8(&mut self, dst: u8, src: u8) {
+        if dst >= 8 || src >= 8 { self.rex(false, dst >= 8, false, src >= 8); }
+        self.u8(0x0F); self.u8(0xB6);
+        self.modrm(3, src & 7, dst & 7);
+    }
+
     fn and_r8_r8(&mut self, dst: u8, src: u8) {
         if dst >= 8 || src >= 8 { self.rex(false, src >= 8, false, dst >= 8); }
         self.u8(0x20); self.modrm(3, src & 7, dst & 7);
@@ -388,11 +436,16 @@ impl Generator {
         // Store parameters
         let param_regs = [1, 2, 8, 9]; // RCX, RDX, R8, R9
         for (i, p) in func.params.iter().enumerate() {
-            self.stack_size += 4;
+            let psz = type_size(&p.param_type).max(4) as u32;
+            self.stack_size += psz.max(8); // minimum 8-byte slot to avoid overlap
             let off = -(self.stack_size as i32);
             self.vars.insert(p.name.clone(), off);
             if i < 4 {
-                self.mov_m64_r64(5, off, param_regs[i]);
+                if psz == 4 {
+                    self.mov_m32_r64(5, off, param_regs[i]);
+                } else {
+                    self.mov_m64_r64(5, off, param_regs[i]);
+                }
             }
         }
 
@@ -404,9 +457,10 @@ impl Generator {
                 if let Stmt::VariableDecl { var_type, .. } = stmt {
                     let vs = match var_type {
                         Some(Type::Named(n)) => struct_size(n, &self.struct_layouts).max(4) as u32,
-                        _ => 4,
+                        Some(ty) => type_size(ty).max(4) as u32,
+                        None => 4,
                     };
-                    sz += vs;
+                    sz += vs.max(8); // minimum 8-byte slot to avoid 8-byte store overlap
                 }
             }
             // sz-8 = actual bytes needed, align to 16, minimum 0x20 (32)
@@ -480,9 +534,10 @@ impl Generator {
             Stmt::VariableDecl { name, var_type, init } => {
                 let var_sz = match var_type {
                     Some(Type::Named(n)) => struct_size(n, &self.struct_layouts).max(4),
-                    _ => 4,
+                    Some(ty) => type_size(ty).max(4),
+                    None => 4,
                 };
-                self.stack_size += var_sz as u32;
+                self.stack_size += (var_sz as u32).max(8); // minimum 8-byte slot
                 let off = -(self.stack_size as i32);
                 self.vars.insert(name.clone(), off);
                 if let Some(ty) = var_type {
@@ -496,15 +551,30 @@ impl Generator {
                             // Compute field offset from struct type
                             if let Some(ty) = var_type {
                                 if let Type::Named(struct_name) = ty {
-                                    if let Some(foff) = field_offset(struct_name, fname, &self.struct_layouts) {
-                                        self.mov_m64_r64(5, off + foff, 0);
+                                    if let Some(fsz) = field_size(struct_name, fname, &self.struct_layouts) {
+                                        if let Some(foff) = field_offset(struct_name, fname, &self.struct_layouts) {
+                                            if fsz == 4 {
+                                                self.mov_m32_r64(5, off + foff, 0);
+                                            } else {
+                                                self.mov_m64_r64(5, off + foff, 0);
+                                            }
+                                        }
                                     }
                                 }
                             }
                         }
                     } else {
                         self.compile_expr_to(e, 0);
-                        self.mov_m64_r64(5, off, 0);
+                        // Use appropriate store width based on type
+                        let is_4byte = match var_type {
+                            Some(Type::Int | Type::Char | Type::Bool) => true,
+                            _ => false,
+                        };
+                        if is_4byte {
+                            self.mov_m32_r64(5, off, 0);
+                        } else {
+                            self.mov_m64_r64(5, off, 0);
+                        }
                     }
                 }
             }
@@ -610,7 +680,15 @@ impl Generator {
             }
             Expr::Identifier(name) => {
                 if let Some(&off) = self.vars.get(name) {
-                    self.mov_r64_m64(reg, 5, off);
+                    let is_4byte = match self.var_types.get(name) {
+                        Some(Type::Int | Type::Char | Type::Bool) => true,
+                        _ => false,
+                    };
+                    if is_4byte {
+                        self.mov_r64_m32(reg, 5, off);
+                    } else {
+                        self.mov_r64_m64(reg, 5, off);
+                    }
                 }
             }
             Expr::Binary { op, left, right } => {
@@ -631,17 +709,26 @@ impl Generator {
                         self.cmp_r64(0, 1);
                         let cc = cc_from_binop(op);
                         self.setcc_r8(cc, 0);
+                        self.movzx_r32_r8(0, 0); // zero-extend result (setcc only sets low byte)
                     }
                     And => {
                         self.cmp_r64_imm32(0, 0); self.setcc_r8(CC_NE, 0);
+                        self.movzx_r32_r8(0, 0);
                         self.cmp_r64_imm32(1, 0); self.setcc_r8(CC_NE, 1);
+                        self.movzx_r32_r8(1, 1);
                         self.and_r8_r8(0, 1);
                     }
                     Or => {
                         self.cmp_r64_imm32(0, 0); self.setcc_r8(CC_NE, 0);
+                        self.movzx_r32_r8(0, 0);
                         self.cmp_r64_imm32(1, 0); self.setcc_r8(CC_NE, 1);
+                        self.movzx_r32_r8(1, 1);
                         self.or_r8_r8(0, 1);
                     }
+                }
+                // Copy result to requested register if needed
+                if reg != 0 && reg != 1 {
+                    self.mov_r64_r64(reg, 0);
                 }
             }
             Expr::Unary { op, operand } => {
@@ -651,6 +738,7 @@ impl Generator {
                         self.compile_expr_to(operand, 0);
                         self.cmp_r64_imm32(0, 0);
                         self.setcc_r8(CC_E, 0);
+                        self.movzx_r32_r8(0, 0);
                     }
                     UnOp::AddrOf => {
                         self.compile_expr_addr(operand, reg);
@@ -667,11 +755,31 @@ impl Generator {
                 match target.as_ref() {
                     Expr::Identifier(name) => {
                         if let Some(&off) = self.vars.get(name) {
-                            self.mov_m64_r64(5, off, 0);
+                            let is_4byte = match self.var_types.get(name) {
+                                Some(Type::Int | Type::Char | Type::Bool) => true,
+                                _ => false,
+                            };
+                            if is_4byte {
+                                self.mov_m32_r64(5, off, 0);
+                            } else {
+                                self.mov_m64_r64(5, off, 0);
+                            }
+                        }
+                    }
+                    Expr::Member { object, member } => {
+                        self.push_r64(0); // save value
+                        self.compile_expr_addr(object, 1); // R1 = struct address
+                        // Check field size for correct store width
+                        let fsz = get_member_field_size(&self.var_types, &self.struct_layouts, object, member);
+                        self.pop_r64(0); // restore value
+                        if fsz == 4 {
+                            self.mov_m32_r64(1, 0, 0);
+                        } else {
+                            self.mov_m64_r64(1, 0, 0);
                         }
                     }
                     _ => {
-                        // Use compile_expr_addr to get target address in R1, then store RAX to it
+                        // General case: compile_expr_addr to get target address in R1, store RAX
                         self.push_r64(0); // save value
                         self.compile_expr_addr(target, 1); // R1 = target address
                         self.pop_r64(0); // restore value
@@ -686,7 +794,12 @@ impl Generator {
                     if let Some(ty) = self.var_types.get(obj_name) {
                         if let Type::Named(struct_name) = ty {
                             if let Some(foff) = field_offset(struct_name, member, &self.struct_layouts) {
-                                self.mov_r64_m64(reg, reg, foff);
+                                let fsz = field_size(struct_name, member, &self.struct_layouts).unwrap_or(8);
+                                if fsz == 4 {
+                                    self.mov_r64_m32(reg, reg, foff);
+                                } else {
+                                    self.mov_r64_m64(reg, reg, foff);
+                                }
                             }
                         }
                     }
@@ -745,6 +858,14 @@ impl Generator {
             self.compile_print(callee, args);
             return;
         }
+        if callee == "read_file" {
+            self.compile_read_file(args);
+            return;
+        }
+        if callee == "write_file" {
+            self.compile_write_file(args);
+            return;
+        }
 
         self.sub_rm64_imm8(4, 0x28);
         let arg_regs = [1, 2, 8, 9];
@@ -760,6 +881,120 @@ impl Generator {
             self.asm[entry as usize..entry as usize + 4].copy_from_slice(&(rel as i32).to_le_bytes());
         }
         self.add_rm64_imm8(4, 0x28);
+    }
+
+    /// read_file(path) — reads entire file, returns pointer to heap-allocated content
+    /// First 8 bytes BEFORE the returned pointer = file size
+    /// i.e. size = *((int*)(ptr - 8)) or just *(ptr - 4) with 32-bit load
+    /// Returns null (0) on failure
+    ///
+    /// Stack layout (0x50 bytes, aligned for Win64):
+    ///   [RSP+0x00..0x1F] = shadow space for API calls (clobbered)
+    ///   [RSP+0x20..0x2F] = 5th/6th arg slots for API calls
+    ///   [RSP+0x30..0x37] = 7th arg slot for CreateFileA
+    ///   [RSP+0x38..0x3F] = handle
+    ///   [RSP+0x40..0x47] = size
+    ///   [RSP+0x48..0x4F] = heap / buffer
+    fn compile_read_file(&mut self, args: &[Expr]) {
+        self.sub_rm64_imm8(4, 0x50);
+
+        // RCX = path (eval to RAX, copy to RCX)
+        if !args.is_empty() { self.compile_expr_to(&args[0], 0); self.mov_r64_r64(1, 0); }
+        // CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL)
+        self.mov_r64_imm32(2, 0x80000000u32); // GENERIC_READ
+        self.mov_r64_imm32(8, 1u32);          // FILE_SHARE_READ
+        self.xor_r64(9, 9);                   // security = NULL
+        self.mov_m64_imm32(4, 0x20, 3);       // OPEN_EXISTING at [RSP+0x20]
+        self.mov_m64_imm32(4, 0x28, 0);       // flags at [RSP+0x28]
+        self.mov_m64_imm32(4, 0x30, 0);       // template at [RSP+0x30]
+        self.emit_import_call("CreateFileA");
+        self.mov_m64_r64(4, 0x38, 0);         // [RSP+0x38] = handle (above shadow space)
+
+        // GetFileSize(handle, NULL)
+        self.mov_r64_m64(1, 4, 0x38);         // RCX = handle from [RSP+0x38]
+        self.xor_r64(2, 2);
+        self.emit_import_call("GetFileSize");
+        self.mov_m64_r64(4, 0x40, 0);         // [RSP+0x40] = size
+
+        // GetProcessHeap()
+        self.emit_import_call("GetProcessHeap");
+        self.mov_m64_r64(4, 0x48, 0);         // [RSP+0x48] = heap
+
+        // HeapAlloc(heap, 8, size + 4) — 4 extra for size prefix
+        self.mov_r64_m64(1, 4, 0x48);         // RCX = heap
+        self.mov_r64_imm32(2, 8);             // EDX = HEAP_ZERO_MEMORY
+        self.mov_r64_m64(8, 4, 0x40);         // R8 = size
+        self.add_rm64_imm8(8, 4);             // R8 += 4
+        self.emit_import_call("HeapAlloc");
+        self.mov_m64_r64(4, 0x48, 0);         // [RSP+0x48] = buffer (overwrites heap, no longer needed)
+
+        // Store size (64-bit) at buffer[0..7], content starts at buffer+4
+        self.mov_r64_m64(8, 4, 0x40);         // R8 = size from [RSP+0x40]
+        self.mov_m64_r64(0, 0, 8);            // [RAX+0] = R8 (buffer[0] = size, RAX still buffer from HeapAlloc)
+
+        // ReadFile(handle, buffer+4, size, &bytesRead, overlapped=NULL)
+        // Win64: 5th arg (overlapped) at [RSP+0x20], bytesRead stored at [RSP+0x28]
+        self.mov_r64_m64(1, 4, 0x38);         // RCX = handle
+        self.mov_r64_m64(2, 4, 0x48);         // RDX = buffer
+        self.add_rm64_imm8(2, 4);             // RDX = buffer + 4
+        self.mov_r64_m64(8, 4, 0x40);         // R8 = size
+        self.lea_r64(9, 4, 0x28);             // R9 = &bytesRead at [RSP+0x28]
+        self.mov_m64_imm32(4, 0x20, 0);       // [RSP+0x20] = overlapped = NULL (5th arg)
+        self.emit_import_call("ReadFile");
+
+        // CloseHandle(handle) — handle at [RSP+0x38] preserved (above shadow + arg slots)
+        self.mov_r64_m64(1, 4, 0x38);
+        self.emit_import_call("CloseHandle");
+
+        // Return buffer+4 (pointer to content) in RAX
+        self.mov_r64_m64(0, 4, 0x48);         // buffer address
+        self.add_rm64_imm8(0, 4);             // +4 → skip size prefix
+        self.add_rm64_imm8(4, 0x50);          // restore RSP
+    }
+
+    /// write_file(path, data, len) — writes len bytes from data pointer to file
+    /// Returns 0 on success
+    ///
+    /// Stack layout (0x48 bytes):
+    ///   [RSP+0x00..0x1F] = shadow space for API calls (clobbered)
+    ///   [RSP+0x20..0x2F] = 5th/6th arg slots
+    ///   [RSP+0x30..0x37] = handle (saved above shadow + arg slots)
+    ///   [RSP+0x38..0x3F] = written count (for WriteFile)
+    ///   [RSP+0x40..0x47] = unused
+    fn compile_write_file(&mut self, args: &[Expr]) {
+        if args.len() < 3 { self.xor_r64(0, 0); return; }
+        self.sub_rm64_imm8(4, 0x48);
+
+        // RCX = path (eval to RAX first, then copy to RCX)
+        self.compile_expr_to(&args[0], 0);
+        self.mov_r64_r64(1, 0);
+        // CreateFileA(path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, NULL)
+        self.mov_r64_imm32(2, 0x40000000u32); // GENERIC_WRITE
+        self.xor_r64(8, 8);                   // no share
+        self.xor_r64(9, 9);                   // security = NULL
+        self.mov_m64_imm32(4, 0x20, 2);       // CREATE_ALWAYS at [RSP+0x20]
+        self.mov_m64_imm32(4, 0x28, 0);       // flags at [RSP+0x28]
+        self.mov_m64_imm32(4, 0x30, 0);       // template at [RSP+0x30]
+        self.emit_import_call("CreateFileA");
+        self.mov_m64_r64(4, 0x30, 0);         // [RSP+0x30] = handle (above shadow, reusing template slot)
+
+        // WriteFile(handle, data, len, &written, NULL)
+        self.mov_r64_m64(1, 4, 0x30);         // RCX = handle from [RSP+0x30]
+        // Evaluate data (arg[1]) and len (arg[2]) into correct regs
+        self.compile_expr_to(&args[1], 0);
+        self.mov_r64_r64(2, 0);               // RDX = data pointer
+        self.compile_expr_to(&args[2], 0);
+        self.mov_r64_r64(8, 0);               // R8 = length
+        self.lea_r64(9, 4, 0x38);             // R9 = &written at [RSP+0x38]
+        self.mov_m64_imm32(4, 0x20, 0);       // [RSP+0x20] = overlapped = NULL (5th arg)
+        self.emit_import_call("WriteFile");
+
+        // CloseHandle(handle) — handle at [RSP+0x30] preserved
+        self.mov_r64_m64(1, 4, 0x30);
+        self.emit_import_call("CloseHandle");
+
+        self.xor_r64(0, 0);
+        self.add_rm64_imm8(4, 0x48);
     }
 
     fn compile_print(&mut self, callee: &str, args: &[Expr]) {

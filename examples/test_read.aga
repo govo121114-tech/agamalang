@@ -1,0 +1,3 @@
+fn main() {
+    let data: *int = read_file("examples\\exit.aga");
+}

@@ -1,4 +1,3 @@
 fn main() {
-    println("A");
-    let data: *int = read_file("examples\\exit.aga");
+    println("hello from agamalang");
 }

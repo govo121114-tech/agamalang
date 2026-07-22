@@ -1,0 +1,94 @@
+fn main() {
+    let pass: int = 0;
+    let fail: int = 0;
+
+    if (str_len("hello") == 5) {
+        println("PASS: str_len");
+        pass = pass + 1;
+    } else {
+        println("FAIL: str_len");
+        fail = fail + 1;
+    }
+
+    if (str_eq("abc", "abc") == 1) {
+        println("PASS: str_eq equal");
+        pass = pass + 1;
+    } else {
+        println("FAIL: str_eq equal");
+        fail = fail + 1;
+    }
+
+    if (str_eq("abc", "abd") == 0) {
+        println("PASS: str_eq not equal");
+        pass = pass + 1;
+    } else {
+        println("FAIL: str_eq not equal");
+        fail = fail + 1;
+    }
+
+    if (str_eq("", "") == 1) {
+        println("PASS: str_eq empty");
+        pass = pass + 1;
+    } else {
+        println("FAIL: str_eq empty");
+        fail = fail + 1;
+    }
+
+    let n: int = str_to_int("12345");
+    if (n == 12345) {
+        println("PASS: str_to_int");
+        pass = pass + 1;
+    } else {
+        println("FAIL: str_to_int");
+        fail = fail + 1;
+    }
+
+    let s: *char = "abc";
+    let c0: int = s[0];
+    let c1: int = s[1];
+    let c2: int = s[2];
+    if (c0 == 97) {
+        println("PASS: s[0] = 'a'");
+        pass = pass + 1;
+    } else {
+        println("FAIL: s[0]");
+        fail = fail + 1;
+    }
+    if (c1 == 98) {
+        println("PASS: s[1] = 'b'");
+        pass = pass + 1;
+    } else {
+        println("FAIL: s[1]");
+        fail = fail + 1;
+    }
+    if (c2 == 99) {
+        println("PASS: s[2] = 'c'");
+        pass = pass + 1;
+    } else {
+        println("FAIL: s[2]");
+        fail = fail + 1;
+    }
+
+    let p: *char = malloc(100);
+    p[0] = 65;
+    p[1] = 66;
+    p[2] = 67;
+    if (p[0] == 65) {
+        println("PASS: malloc + write");
+        pass = pass + 1;
+    } else {
+        println("FAIL: malloc + write");
+        fail = fail + 1;
+    }
+    if (p[1] == 66) {
+        println("PASS: p[1]");
+        pass = pass + 1;
+    } else {
+        println("FAIL: p[1]");
+        fail = fail + 1;
+    }
+    free(p);
+    println("PASS: free");
+
+    println(pass);
+}

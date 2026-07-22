@@ -1,0 +1,23 @@
+fn main() {
+    if (str_len("hello") == 5) { println("PASS: str_len"); } else { println("FAIL: str_len"); }
+    if (str_eq("abc", "abc") == 1) { println("PASS: str_eq equal"); } else { println("FAIL: str_eq equal"); }
+    if (str_eq("abc", "abd") == 0) { println("PASS: str_eq not equal"); } else { println("FAIL: str_eq not equal"); }
+    if (str_eq("", "") == 1) { println("PASS: str_eq empty"); } else { println("FAIL: str_eq empty"); }
+    let n: int = str_to_int("12345");
+    if (n == 12345) { println("PASS: str_to_int"); } else { println("FAIL: str_to_int"); }
+    let s: *char = "abc";
+    let c0: int = s[0];
+    let c1: int = s[1];
+    let c2: int = s[2];
+    if (c0 == 97) { println("PASS: s[0] = 'a'"); } else { println("FAIL: s[0]"); }
+    if (c1 == 98) { println("PASS: s[1] = 'b'"); } else { println("FAIL: s[1]"); }
+    if (c2 == 99) { println("PASS: s[2] = 'c'"); } else { println("FAIL: s[2]"); }
+    let p: *char = malloc(100);
+    p[0] = 65;
+    p[1] = 66;
+    p[2] = 67;
+    if (p[0] == 65) { println("PASS: malloc + write"); } else { println("FAIL: malloc + write"); }
+    if (p[1] == 66) { println("PASS: p[1]"); } else { println("FAIL: p[1]"); }
+    free(p);
+    println("all done");
+}

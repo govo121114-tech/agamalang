@@ -60,6 +60,13 @@ impl Parser {
                     let sd = self.parse_struct_def();
                     program.structs.push(sd);
                 }
+                TokenKind::Let => {
+                    // Top-level let declarations (global constants)
+                    // Skip them — they are processed as regular variable decls
+                    // inside the codegen based on symbol table.
+                    // For now, just parse and discard.
+                    let _ = self.parse_variable_decl();
+                }
                 _ => {
                     eprintln!(
                         "Error: unexpected token '{}' at line {}",
@@ -649,7 +656,7 @@ impl Parser {
                 if matches!(self.peek_kind(), TokenKind::LBrace) {
                     return self.parse_struct_init(name);
                 }
-                // Check for function call
+                // Check for function call: name(...)
                 if matches!(self.peek_kind(), TokenKind::LParen) {
                     self.advance();
                     let mut args = Vec::new();
@@ -666,32 +673,29 @@ impl Parser {
                     self.expect(&TokenKind::RParen);
                     return Expr::Call { callee: name, args };
                 }
-                // Check for member access
-                if matches!(self.peek_kind(), TokenKind::Dot) {
-                    self.advance();
-                    let member = match self.advance().kind.clone() {
-                        TokenKind::Identifier(m) => m,
-                        _ => {
-                            eprintln!("Error: expected member name at line {}", self.peek().line);
-                            String::new()
-                        }
-                    };
-                    return Expr::Member {
-                        object: Box::new(Expr::Identifier(name)),
-                        member,
-                    };
+                // Build base expression, then chain postfix ops: .field and [index]
+                let mut expr = Expr::Identifier(name);
+                loop {
+                    if matches!(self.peek_kind(), TokenKind::Dot) {
+                        self.advance();
+                        let member = match self.advance().kind.clone() {
+                            TokenKind::Identifier(m) => m,
+                            _ => {
+                                eprintln!("Error: expected member name at line {}", self.peek().line);
+                                String::new()
+                            }
+                        };
+                        expr = Expr::Member { object: Box::new(expr), member };
+                    } else if matches!(self.peek_kind(), TokenKind::LBracket) {
+                        self.advance();
+                        let index = self.parse_expr();
+                        self.expect(&TokenKind::RBracket);
+                        expr = Expr::Index { object: Box::new(expr), index: Box::new(index) };
+                    } else {
+                        break;
+                    }
                 }
-                // Check for array index
-                if matches!(self.peek_kind(), TokenKind::LBracket) {
-                    self.advance();
-                    let index = self.parse_expr();
-                    self.expect(&TokenKind::RBracket);
-                    return Expr::Index {
-                        object: Box::new(Expr::Identifier(name)),
-                        index: Box::new(index),
-                    };
-                }
-                Expr::Identifier(name)
+                expr
             }
             TokenKind::LParen => {
                 let expr = self.parse_expr();

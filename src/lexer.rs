@@ -144,15 +144,42 @@ impl Lexer {
     fn read_number(&mut self, first: char) -> TokenKind {
         let mut s = String::new();
         s.push(first);
-        while let Some(ch) = self.peek() {
-            if ch.is_ascii_digit() {
-                s.push(ch);
-                self.advance();
-            } else {
-                break;
+        let mut is_hex = false;
+        if first == '0' {
+            if let Some(next) = self.peek() {
+                if next == 'x' || next == 'X' {
+                    is_hex = true;
+                    s.push('x');
+                    self.advance();
+                }
             }
         }
-        let n: i64 = s.parse().unwrap_or(0);
+        while let Some(ch) = self.peek() {
+            if is_hex {
+                if ch.is_ascii_hexdigit() {
+                    s.push(ch);
+                    self.advance();
+                } else {
+                    break;
+                }
+            } else {
+                if ch.is_ascii_digit() {
+                    s.push(ch);
+                    self.advance();
+                } else {
+                    break;
+                }
+            }
+        }
+        let n: i64 = if is_hex {
+            if s.len() > 2 {
+                i64::from_str_radix(&s[2..], 16).unwrap_or(0)
+            } else {
+                0
+            }
+        } else {
+            s.parse().unwrap_or(0)
+        };
         TokenKind::Integer(n)
     }
 

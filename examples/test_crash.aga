@@ -1,0 +1,17 @@
+fn main() {
+    let s: *char = "abc";
+    let c0: int = s[0];
+    let c1: int = s[1];
+    let c2: int = s[2];
+    println("before malloc");
+    let p: *char = malloc(100);
+    println("after malloc");
+    p[0] = 65;
+    if (p[0] == 65) {
+        println("PASS");
+    } else {
+        println("FAIL");
+    }
+    free(p);
+    println("done");
+}

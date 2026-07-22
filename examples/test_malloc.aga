@@ -1,0 +1,11 @@
+fn main() {
+    let p: *char = malloc(100);
+    p[0] = 65;
+    if (p[0] == 65) {
+        println("PASS: malloc + write");
+    } else {
+        println("FAIL: malloc + write");
+    }
+    free(p);
+    println("done");
+}

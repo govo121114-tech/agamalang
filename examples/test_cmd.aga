@@ -1,0 +1,4 @@
+fn main() {
+    let s: *char = cmdline();
+    println(s);
+}

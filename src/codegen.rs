@@ -57,14 +57,48 @@ fn get_member_field_size(
     object: &Expr,
     member: &str,
 ) -> i32 {
-    if let Expr::Identifier(obj_name) = object {
-        if let Some(ty) = var_types.get(obj_name) {
-            if let Type::Named(struct_name) = ty {
-                return field_size(struct_name, member, layouts).unwrap_or(8);
-            }
-        }
+    if let Some(sname) = resolve_struct_name(object, var_types) {
+        return field_size(sname, member, layouts).unwrap_or(8);
     }
     8
+}
+
+/// Resolve the struct name from an expression (Identifier or Index into *Struct)
+fn resolve_struct_name<'a>(expr: &Expr, var_types: &'a HashMap<String, Type>) -> Option<&'a str> {
+    match expr {
+        Expr::Identifier(name) => {
+            if let Some(Type::Named(n)) = var_types.get(name) {
+                return Some(n.as_str());
+            }
+            None
+        }
+        Expr::Index { object, .. } => {
+            if let Expr::Identifier(oname) = object.as_ref() {
+                if let Some(Type::Ptr(inner)) = var_types.get(oname) {
+                    if let Type::Named(n) = inner.as_ref() {
+                        return Some(n.as_str());
+                    }
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+/// Get the element size for a pointer/array expression (1 for *char, struct_size for *Struct, 4 for *int, etc.)
+fn get_ptr_elem_size(expr: &Expr, var_types: &HashMap<String, Type>, layouts: &HashMap<String, StructLayout>) -> i32 {
+    if let Expr::Identifier(name) = expr {
+        match var_types.get(name) {
+            Some(Type::Ptr(inner)) => match inner.as_ref() {
+                Type::Char => 1,
+                Type::Named(n) => struct_size(n, layouts),
+                _ => 4,
+            },
+            Some(Type::Array(inner)) | Some(Type::StaticArray(inner, _)) => type_size(inner),
+            _ => 4,
+        }
+    } else { 4 }
 }
 
 /// Compile a program and return the compiled unit
@@ -463,8 +497,8 @@ impl Generator {
                     sz += vs.max(8); // minimum 8-byte slot to avoid 8-byte store overlap
                 }
             }
-            // sz-8 = actual bytes needed, align to 16, minimum 0x20 (32)
-            let needed = sz.saturating_sub(8);
+            // Use full sz to cover the last variable's complete extent
+            let needed = sz;
             ((needed + 15) & !15).max(0x20)
         };
         if max_var_stack > 0 {
@@ -499,30 +533,32 @@ impl Generator {
             }
             Expr::Member { object, member } => {
                 self.compile_expr_addr(object, reg);
-                if let Expr::Identifier(obj_name) = object.as_ref() {
-                    if let Some(ty) = self.var_types.get(obj_name) {
-                        if let Type::Named(struct_name) = ty {
-                            if let Some(foff) = field_offset(struct_name, member, &self.struct_layouts) {
-                                if foff != 0 {
-                                    self.add_rm64_imm8(reg, foff as i8);
-                                }
-                            }
-                        }
+                if let Some(sname) = resolve_struct_name(object, &self.var_types) {
+                    if let Some(foff) = field_offset(sname, member, &self.struct_layouts) {
+                        if foff != 0 { self.add_rm64_imm8(reg, foff as i8); }
                     }
                 }
             }
             Expr::Index { object, index } => {
-                self.compile_expr_addr(object, reg);
-                // Save address, compute index*4, add to address
-                self.push_r64(reg);
-                self.compile_expr_to(index, 0); // index in RAX
-                self.mov_r64_imm32(1, 4);
-                self.imul_r64(0, 1); // RAX = index * 4
-                self.pop_r64(1); // R1 = base address
-                self.add_r64(1, 0); // R1 = base + index*4
-                if reg != 1 {
-                    self.mov_r64_r64(reg, 1);
+                let is_ptr = matches!(object.as_ref(), Expr::Identifier(oname)
+                    if self.var_types.get(oname).map_or(false, |t| matches!(t, Type::Ptr(_))));
+                let elem_size = if is_ptr {
+                    get_ptr_elem_size(object, &self.var_types, &self.struct_layouts)
+                } else { 4 };
+                if is_ptr {
+                    self.compile_expr_to(object, reg);
+                } else {
+                    self.compile_expr_addr(object, reg);
                 }
+                self.push_r64(reg);
+                self.compile_expr_to(index, 0);
+                if elem_size != 1 {
+                    self.mov_r64_imm32(1, elem_size as u32);
+                    self.imul_r64(0, 1);
+                }
+                self.pop_r64(1);
+                self.add_r64(1, 0);
+                if reg != 1 { self.mov_r64_r64(reg, 1); }
             }
             _ => {}
         }
@@ -749,7 +785,10 @@ impl Generator {
                     }
                 }
             }
-            Expr::Call { callee, args } => { self.compile_call(callee, args); }
+            Expr::Call { callee, args } => {
+                self.compile_call(callee, args);
+                if reg != 0 { self.mov_r64_r64(reg, 0); }
+            }
             Expr::Assign { target, value } => {
                 self.compile_expr_to(value, 0);
                 match target.as_ref() {
@@ -769,10 +808,27 @@ impl Generator {
                     Expr::Member { object, member } => {
                         self.push_r64(0); // save value
                         self.compile_expr_addr(object, 1); // R1 = struct address
-                        // Check field size for correct store width
                         let fsz = get_member_field_size(&self.var_types, &self.struct_layouts, object, member);
+                        if let Some(sname) = resolve_struct_name(object, &self.var_types) {
+                            if let Some(foff) = field_offset(sname, member, &self.struct_layouts) {
+                                if foff != 0 { self.add_rm64_imm8(1, foff as i8); }
+                            }
+                        }
                         self.pop_r64(0); // restore value
                         if fsz == 4 {
+                            self.mov_m32_r64(1, 0, 0);
+                        } else {
+                            self.mov_m64_r64(1, 0, 0);
+                        }
+                    }
+                    Expr::Index { object, index } => {
+                        self.push_r64(0);
+                        self.compile_expr_addr(target, 1);
+                        self.pop_r64(0);
+                        let elem_size = get_ptr_elem_size(object, &self.var_types, &self.struct_layouts);
+                        if elem_size == 1 {
+                            self.u8(0x88); self.modrm(0, 0, 1);
+                        } else if elem_size == 4 {
                             self.mov_m32_r64(1, 0, 0);
                         } else {
                             self.mov_m64_r64(1, 0, 0);
@@ -790,31 +846,34 @@ impl Generator {
             Expr::Member { object, member } => {
                 // Get ADDRESS of object, then load field at offset
                 self.compile_expr_addr(object, reg);
-                if let Expr::Identifier(obj_name) = object.as_ref() {
-                    if let Some(ty) = self.var_types.get(obj_name) {
-                        if let Type::Named(struct_name) = ty {
-                            if let Some(foff) = field_offset(struct_name, member, &self.struct_layouts) {
-                                let fsz = field_size(struct_name, member, &self.struct_layouts).unwrap_or(8);
-                                if fsz == 4 {
-                                    self.mov_r64_m32(reg, reg, foff);
-                                } else {
-                                    self.mov_r64_m64(reg, reg, foff);
-                                }
-                            }
+                if let Some(sname) = resolve_struct_name(object, &self.var_types) {
+                    if let Some(foff) = field_offset(sname, member, &self.struct_layouts) {
+                        let fsz = field_size(sname, member, &self.struct_layouts).unwrap_or(8);
+                        if fsz == 4 {
+                            self.mov_r64_m32(reg, reg, foff);
+                        } else {
+                            self.mov_r64_m64(reg, reg, foff);
                         }
                     }
                 }
             }
             Expr::Index { object, index } => {
-                // Compute base address, index * 4, then load
+                let elem_size = get_ptr_elem_size(object, &self.var_types, &self.struct_layouts);
+                // Compute pointer value: for pointer vars, load value; for array vars, compile_to
                 self.compile_expr_to(object, 0);
                 self.push_r64(0);
                 self.compile_expr_to(index, 1);
-                self.pop_r64(0); // R0 = base, R1 = index
-                self.mov_r64_imm32(2, 4);
-                self.imul_r64(1, 2); // R1 = index * 4
-                self.add_r64(0, 1); // R0 = base + index * 4
-                self.mov_r64_m64(reg, 0, 0); // load value at [base + index*4]
+                self.pop_r64(0);
+                if elem_size != 1 {
+                    self.mov_r64_imm32(2, elem_size as u32);
+                    self.imul_r64(1, 2);
+                }
+                self.add_r64(0, 1);
+                if elem_size == 1 {
+                    self.movzx_r64(reg, 0, 0);
+                } else {
+                    self.mov_r64_m32(reg, 0, 0);
+                }
             }
             Expr::ArrayInit(elems) => {
                 // Allocate temp space on stack, store elements, return pointer
@@ -866,6 +925,12 @@ impl Generator {
             self.compile_write_file(args);
             return;
         }
+        if callee == "str_eq" { self.compile_str_eq(args); return; }
+        if callee == "str_len" { self.compile_str_len(args); return; }
+        if callee == "str_to_int" { self.compile_str_to_int(args); return; }
+        if callee == "malloc" { self.compile_malloc(args); return; }
+        if callee == "free" { self.compile_free(args); return; }
+        if callee == "cmdline" { self.compile_cmdline(args); return; }
 
         self.sub_rm64_imm8(4, 0x28);
         let arg_regs = [1, 2, 8, 9];
@@ -997,9 +1062,142 @@ impl Generator {
         self.add_rm64_imm8(4, 0x48);
     }
 
+    /// str_eq(str1, str2): compare two null-terminated strings by content
+    /// Returns 1 if equal, 0 if not.
+    fn compile_str_eq(&mut self, args: &[Expr]) {
+        if args.len() < 2 { self.xor_r64(0, 0); return; }
+        self.compile_expr_to(&args[0], 0);  self.mov_r64_r64(8, 0); // R8 = str1
+        self.compile_expr_to(&args[1], 0);  self.mov_r64_r64(9, 0); // R9 = str2
+
+        let loop_lbl = self.new_label();
+        let noteq_lbl = self.new_label();
+        let foundeq_lbl = self.new_label();
+        let end_lbl = self.new_label();
+        self.put_label(loop_lbl);
+        self.movzx_r64(2, 8, 0);  // RDX = byte [R8]
+        self.u8(0x4D); self.u8(0x0F); self.u8(0xB6); self.u8(0x11); // movzx r10, byte [r9]
+        self.cmp_r64(2, 10);
+        self.jcc_rel32(CC_NE);
+        self.add_label_fixup(self.asm.len() as u32 - 4, noteq_lbl, true);
+        self.u8(0x48); self.u8(0x85); self.u8(0xD2);  // test rdx, rdx
+        self.jcc_rel32(CC_E);
+        self.add_label_fixup(self.asm.len() as u32 - 4, foundeq_lbl, true);
+        self.u8(0x49); self.u8(0xFF); self.u8(0xC0);  // inc r8
+        self.u8(0x49); self.u8(0xFF); self.u8(0xC1);  // inc r9
+        self.jmp_rel32();
+        self.add_label_fixup(self.asm.len() as u32 - 4, loop_lbl, true);
+
+        self.put_label(noteq_lbl);
+        self.xor_r64(0, 0);  // RAX = 0 (not equal)
+        self.jmp_rel32();
+        self.add_label_fixup(self.asm.len() as u32 - 4, end_lbl, true);
+
+        self.put_label(foundeq_lbl);
+        self.mov_r64_imm32(0, 1);  // RAX = 1 (equal)
+
+        self.put_label(end_lbl);
+    }
+
+    /// str_len(str): return length of null-terminated string in RAX
+    fn compile_str_len(&mut self, args: &[Expr]) {
+        if args.is_empty() { self.xor_r64(0, 0); return; }
+        self.compile_expr_to(&args[0], 0);  self.xor_r64(1, 1);
+        let loop_lbl = self.new_label();
+        let done_lbl = self.new_label();
+        self.put_label(loop_lbl);
+        self.u8(0x80); self.u8(0x3C); self.u8(0x08); self.u8(0x00);
+        self.jcc_rel32(CC_E);
+        self.add_label_fixup(self.asm.len() as u32 - 4, done_lbl, true);
+        self.u8(0x48); self.u8(0xFF); self.u8(0xC1);
+        self.jmp_rel32();
+        self.add_label_fixup(self.asm.len() as u32 - 4, loop_lbl, true);
+        self.put_label(done_lbl);
+        self.mov_r64_r64(0, 1);
+    }
+
+    /// str_to_int(str): parse decimal integer from string, return in RAX
+    fn compile_str_to_int(&mut self, args: &[Expr]) {
+        if args.is_empty() { self.xor_r64(0, 0); return; }
+        self.compile_expr_to(&args[0], 0);  self.mov_r64_r64(8, 0); // R8 = str
+        self.xor_r64(0, 0);  // RAX = result
+
+        let loop_lbl = self.new_label();
+        let done_lbl = self.new_label();
+        self.put_label(loop_lbl);
+        self.movzx_r64(1, 8, 0);   // RCX = byte [R8]
+        self.cmp_r64_imm32(1, 0);  // null terminator?
+        self.jcc_rel32(CC_E);
+        self.add_label_fixup(self.asm.len() as u32 - 4, done_lbl, true);
+        self.cmp_r64_imm32(1, 48); // cmp rcx, '0'
+        self.jcc_rel32(CC_L);
+        self.add_label_fixup(self.asm.len() as u32 - 4, done_lbl, true);
+        self.cmp_r64_imm32(1, 57); // cmp rcx, '9'
+        self.jcc_rel32(CC_G);
+        self.add_label_fixup(self.asm.len() as u32 - 4, done_lbl, true);
+        // result = result * 10
+        self.rex(true, false, false, false);
+        self.u8(0x8D);
+        self.modrm(0, 0, 4);
+        self.u8(0x80);             // lea rax, [rax + rax*4]
+        self.add_r64(0, 0);        // rax = rax + rax  (→ rax *= 10)
+        // result = result + (digit - '0')
+        self.sub_rm64_imm8(1, 48); // rcx -= '0'
+        self.add_r64(0, 1);        // rax += rcx
+        self.u8(0x49); self.u8(0xFF); self.u8(0xC0);  // inc r8
+        self.jmp_rel32();
+        self.add_label_fixup(self.asm.len() as u32 - 4, loop_lbl, true);
+
+        self.put_label(done_lbl);
+    }
+
+    /// malloc(size): allocate zero-initialized memory from process heap
+    fn compile_malloc(&mut self, args: &[Expr]) {
+        if args.is_empty() { self.xor_r64(0, 0); return; }
+        self.compile_expr_to(&args[0], 0);
+        self.sub_rm64_imm8(4, 0x28);
+        self.mov_m64_r64(4, 0x20, 0);   // save size at [RSP+0x20]
+        self.emit_import_call("GetProcessHeap");
+        self.mov_r64_r64(1, 0);         // RCX = heap
+        self.mov_r64_imm32(2, 8);       // EDX = HEAP_ZERO_MEMORY
+        self.mov_r64_m64(8, 4, 0x20);   // R8 = size (reload)
+        self.emit_import_call("HeapAlloc");
+        self.add_rm64_imm8(4, 0x28);
+    }
+
+    /// free(ptr): free memory allocated by malloc
+    fn compile_free(&mut self, args: &[Expr]) {
+        if args.is_empty() { return; }
+        self.compile_expr_to(&args[0], 0);
+        self.sub_rm64_imm8(4, 0x28);
+        self.mov_m64_r64(4, 0x20, 0);   // save ptr at [RSP+0x20]
+        self.emit_import_call("GetProcessHeap");
+        self.mov_r64_r64(1, 0);         // RCX = heap
+        self.xor_r64(2, 2);             // EDX = 0
+        self.mov_r64_m64(8, 4, 0x20);   // R8 = ptr (reload)
+        self.emit_import_call("HeapFree");
+        self.add_rm64_imm8(4, 0x28);
+    }
+
+    fn compile_cmdline(&mut self, args: &[Expr]) {
+        self.sub_rm64_imm8(4, 0x28);
+        self.emit_import_call("GetCommandLineA");
+        self.add_rm64_imm8(4, 0x28);
+    }
+
     fn compile_print(&mut self, callee: &str, args: &[Expr]) {
         if args.is_empty() { return; }
         match &args[0] {
+            Expr::Identifier(name) => {
+                if let Some(Type::Ptr(inner)) = self.var_types.get(name) {
+                    if matches!(inner.as_ref(), Type::Char) {
+                        self.compile_expr_to(&args[0], 0);
+                        self.emit_print_string_runtime(callee == "println");
+                        return;
+                    }
+                }
+                self.compile_expr_to(&args[0], 0);
+                self.emit_print_int(callee == "println");
+            },
             Expr::String(s) => {
                 let s = format!("{}{}", s, if callee == "println" { "\r\n" } else { "" });
                 self.emit_print_string(&s);
@@ -1122,6 +1320,58 @@ impl Generator {
         self.add_rm64_imm8(4, 32);  // free buffer
         self.pop_r64(7);            // RDI
         self.pop_r64(3);            // RBX
+    }
+
+    /// Print a runtime string pointer (already in RAX). Computes length via strlen.
+    fn emit_print_string_runtime(&mut self, add_newline: bool) {
+        self.push_r64(3);   // RBX
+        self.push_r64(7);   // RDI
+
+        // RBX = string pointer, RDI = length (strlen)
+        self.mov_r64_r64(3, 0);
+        self.mov_r64_r64(7, 3);
+        self.xor_r64(0, 0);
+        self.mov_r64_imm32(1, 0xFFFFFFFFu32);
+        self.u8(0xF2); self.u8(0xAE);
+        self.rex(true, false, false, false); self.u8(0xF7); self.modrm(3, 2, 1);
+        self.rex(true, false, false, false); self.u8(0xFF); self.modrm(3, 1, 1);
+        self.mov_r64_r64(7, 1);
+
+        // GetStdHandle(STD_OUTPUT_HANDLE)
+        self.sub_rm64_imm8(4, 0x28);
+        self.mov_r64_imm32(1, 0xFFFFFFF5u32);
+        self.emit_import_call("GetStdHandle");
+        self.add_rm64_imm8(4, 0x28);
+
+        // WriteFile(handle, string, length, &written, NULL)
+        self.mov_r64_r64(1, 0);   // RCX = handle
+        self.mov_r64_r64(2, 3);   // RDX = string
+        self.mov_r64_r64(8, 7);   // R8 = length
+        self.sub_rm64_imm8(4, 0x38);
+        self.lea_r64(9, 4, 0x30);
+        self.mov_m64_imm32(4, 0x20, 0);
+        self.emit_import_call("WriteFile");
+        self.add_rm64_imm8(4, 0x38);
+
+        if add_newline {
+            // WriteFile(handle, "\r\n", 2, &written, NULL) — re-get handle
+            self.sub_rm64_imm8(4, 0x28);
+            self.mov_r64_imm32(1, 0xFFFFFFF5u32);
+            self.emit_import_call("GetStdHandle");
+            self.add_rm64_imm8(4, 0x28);
+            self.sub_rm64_imm8(4, 0x38);
+            self.mov_m64_imm32(4, 0x30, 0x0A0D);
+            self.lea_r64(2, 4, 0x30);
+            self.mov_r64_imm32(8, 2);
+            self.mov_r64_r64(1, 0);
+            self.lea_r64(9, 4, 0x28);
+            self.mov_m64_imm32(4, 0x20, 0);
+            self.emit_import_call("WriteFile");
+            self.add_rm64_imm8(4, 0x38);
+        }
+
+        self.pop_r64(7);
+        self.pop_r64(3);
     }
 
     fn emit_import_call(&mut self, name: &str) {

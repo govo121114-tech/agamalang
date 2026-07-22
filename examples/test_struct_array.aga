@@ -1,0 +1,52 @@
+struct Token {
+    kind: int;
+    value: *char;
+    line: int;
+}
+
+fn main() {
+    let tokens: *Token = malloc(3 * sizeof(Token));
+    tokens[0].kind = 1;
+    tokens[0].value = "hello";
+    tokens[0].line = 42;
+    tokens[1].kind = 2;
+    tokens[2].kind = 3;
+
+    if (tokens[0].kind == 1) {
+        println("PASS: tokens[0].kind");
+    } else {
+        println("FAIL: tokens[0].kind");
+    }
+    if (tokens[1].kind == 2) {
+        println("PASS: tokens[1].kind");
+    } else {
+        println("FAIL: tokens[1].kind");
+    }
+    if (tokens[2].kind == 3) {
+        println("PASS: tokens[2].kind");
+    } else {
+        println("FAIL: tokens[2].kind");
+    }
+    if (tokens[0].line == 42) {
+        println("PASS: tokens[0].line");
+    } else {
+        println("FAIL: tokens[0].line");
+    }
+
+    let k: int = tokens[0].kind;
+    if (k == 1) {
+        println("PASS: load tokens[0].kind");
+    } else {
+        println("FAIL: load tokens[0].kind");
+    }
+
+    tokens[0].kind = tokens[0].kind + 1;
+    if (tokens[0].kind == 2) {
+        println("PASS: tokens[0].kind++");
+    } else {
+        println("FAIL: tokens[0].kind++");
+    }
+
+    free(tokens);
+    println("done");
+}

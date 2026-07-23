@@ -1,0 +1,85 @@
+// AgamaLang Codegen Operators Test
+// Tests: all binary operations produce correct results
+
+fn main() {
+    let pass: int = 0;
+
+    // === Addition ===
+    let a: int = 10 + 20;
+    if (a == 30) { pass = pass + 1; } else { println("FAIL: add"); }
+
+    // === Subtraction ===
+    let s: int = 50 - 17;
+    if (s == 33) { pass = pass + 1; } else { println("FAIL: sub"); }
+
+    // === Multiplication ===
+    let m: int = 7 * 8;
+    if (m == 56) { pass = pass + 1; } else { println("FAIL: mul"); }
+
+    // === Division ===
+    let d: int = 100 / 3;
+    if (d == 33) { pass = pass + 1; } else { println("FAIL: div"); }
+
+    // === Modulus ===
+    let r: int = 100 % 3;
+    if (r == 1) { pass = pass + 1; } else { println("FAIL: mod"); }
+
+    // === Negation ===
+    let n: int = -42;
+    if (n == -42) { pass = pass + 1; } else { println("FAIL: negate"); }
+
+    // === Equality ===
+    if (1 == 1) { pass = pass + 1; } else { println("FAIL: eq true"); }
+    if (!(1 == 2)) { pass = pass + 1; } else { println("FAIL: eq false"); }
+
+    // === Not-equal ===
+    if (1 != 2) { pass = pass + 1; } else { println("FAIL: neq true"); }
+    if (!(1 != 1)) { pass = pass + 1; } else { println("FAIL: neq false"); }
+
+    // === Less than ===
+    if (1 < 2) { pass = pass + 1; } else { println("FAIL: lt"); }
+    if (!(2 < 1)) { pass = pass + 1; } else { println("FAIL: lt false"); }
+    if (!(2 < 2)) { pass = pass + 1; } else { println("FAIL: lt eq false"); }
+
+    // === Greater than ===
+    if (2 > 1) { pass = pass + 1; } else { println("FAIL: gt"); }
+    if (!(1 > 2)) { pass = pass + 1; } else { println("FAIL: gt false"); }
+
+    // === Less-equal ===
+    if (1 <= 2) { pass = pass + 1; } else { println("FAIL: le"); }
+    if (2 <= 2) { pass = pass + 1; } else { println("FAIL: le eq"); }
+
+    // === Greater-equal ===
+    if (2 >= 1) { pass = pass + 1; } else { println("FAIL: ge"); }
+    if (2 >= 2) { pass = pass + 1; } else { println("FAIL: ge eq"); }
+
+    // === Operator precedence ===
+    let prec1: int = 2 + 3 * 4;        // 2 + 12 = 14
+    if (prec1 == 14) { pass = pass + 1; } else { println("FAIL: precedence mul"); }
+
+    let prec2: int = (2 + 3) * 4;      // 5 * 4 = 20
+    if (prec2 == 20) { pass = pass + 1; } else { println("FAIL: precedence parens"); }
+
+    let prec3: int = 10 - 3 - 2;       // (10-3)-2 = 5 (left-assoc)
+    if (prec3 == 5) { pass = pass + 1; } else { println("FAIL: precedence left assoc"); }
+
+    let prec4: int = 10 + 5 - 3;       // 12
+    if (prec4 == 12) { pass = pass + 1; } else { println("FAIL: precedence add sub"); }
+
+    // === Complex expressions ===
+    let complex: int = (1 + 2) * (10 - 5) / 3 + 4;
+    // 3 * 5 / 3 + 4 = 15/3+4 = 5+4 = 9
+    if (complex == 9) { pass = pass + 1; } else { println("FAIL: complex expr"); }
+
+    // === Variable assignment ===
+    let v: int = 0;
+    v = 42;
+    if (v == 42) { pass = pass + 1; } else { println("FAIL: assign"); }
+
+    // === Compound assign via binary op ===
+    let c: int = 5;
+    c = c + 3;
+    if (c == 8) { pass = pass + 1; } else { println("FAIL: compound add"); }
+
+    println(pass);
+}

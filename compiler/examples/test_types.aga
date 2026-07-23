@@ -1,0 +1,11 @@
+fn main() {
+    let x: upint = 42;
+    let y: unint = 5;
+    let z: fixed = 3.14;
+    print("upint: ");
+    println(x);
+    print("unint: ");
+    println(y);
+    print("fixed: ");
+    println(z);
+}

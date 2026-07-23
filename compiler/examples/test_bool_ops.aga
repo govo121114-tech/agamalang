@@ -1,0 +1,39 @@
+// AgamaLang Boolean Operations Test
+// Tests: &&, ||, ! with truth tables and short-circuit behavior
+
+fn main() {
+    // === Logical NOT ===
+    if (!0 == 1) { println("PASS: !0 = true"); }
+    if (!1 == 0) { println("PASS: !1 = false"); }
+
+    // === Logical AND truth table ===
+    let t: int = 1;
+    let f: int = 0;
+
+    if ((t && t) == 1) { println("PASS: true && true = true"); }
+    if ((t && f) == 0) { println("PASS: true && false = false"); }
+    if ((f && t) == 0) { println("PASS: false && true = false"); }
+    if ((f && f) == 0) { println("PASS: false && false = false"); }
+
+    // === Logical OR truth table ===
+    if ((t || t) == 1) { println("PASS: true || true = true"); }
+    if ((t || f) == 1) { println("PASS: true || false = true"); }
+    if ((f || t) == 1) { println("PASS: false || true = true"); }
+    if ((f || f) == 0) { println("PASS: false || false = false"); }
+
+    // === Combined boolean expressions ===
+    let x: int = 5;
+    let y: int = 10;
+
+    if ((x < y) && (y > 0)) { println("PASS: combined AND"); }
+    if ((x > y) || (y > 0)) { println("PASS: combined OR"); }
+
+    // === Boolean with comparison operators ===
+    if ((1 < 2) && (2 < 3)) { println("PASS: chained comparisons via AND"); }
+
+    // === Test non-zero values as truthy ===
+    if (42) { println("PASS: 42 is truthy"); }
+    if (!0) { println("PASS: !0 is truthy"); }
+
+    println("PASS: all boolean tests");
+}

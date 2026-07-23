@@ -1,0 +1,6 @@
+eat gdi
+
+fn main() {
+    let desk: int = get_dc(0);
+    sleep(100);
+}

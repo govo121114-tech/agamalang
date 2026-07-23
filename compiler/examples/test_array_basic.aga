@@ -1,0 +1,62 @@
+// AgamaLang Array Basic Test
+// Tests: array indexing (static arrays, pointer arrays), element access
+
+struct Item {
+    id: int;
+    val: int;
+}
+
+fn main() {
+    // === Pointer arithmetic with malloc array ===
+    let arr: *int = malloc(5 * 4);
+
+    // Write elements
+    arr[0] = 10;
+    arr[1] = 20;
+    arr[2] = 30;
+    arr[3] = 40;
+    arr[4] = 50;
+
+    // Read elements
+    if (arr[0] == 10) { println("PASS: arr[0]"); }
+    if (arr[1] == 20) { println("PASS: arr[1]"); }
+    if (arr[2] == 30) { println("PASS: arr[2]"); }
+    if (arr[3] == 40) { println("PASS: arr[3]"); }
+    if (arr[4] == 50) { println("PASS: arr[4]"); }
+
+    // === Index with computed expression ===
+    let idx: int = 2;
+    if (arr[idx] == 30) { println("PASS: arr[var]"); }
+
+    let idx2: int = idx + 1;
+    if (arr[idx2] == 40) { println("PASS: arr[var+1]"); }
+
+    // === Write via computed index ===
+    arr[3] = 999;
+    if (arr[3] == 999) { println("PASS: write via index"); }
+
+    // === Pointer to char (char* = string) ===
+    let s: *char = "ABC";
+    if (s[0] == 65) { println("PASS: s[0] = 'A'"); }
+    if (s[1] == 66) { println("PASS: s[1] = 'B'"); }
+    if (s[2] == 67) { println("PASS: s[2] = 'C'"); }
+
+    free(arr);
+
+    // === Array of structs (via pointer) ===
+    let items: *Item = malloc(3 * sizeof(Item));
+    // Write fields via array index then member
+    items[0].id = 100;
+    items[0].val = 200;
+    items[1].id = 101;
+    items[2].val = 300;
+
+    if (items[0].id == 100) { println("PASS: items[0].id"); }
+    if (items[0].val == 200) { println("PASS: items[0].val"); }
+    if (items[1].id == 101) { println("PASS: items[1].id"); }
+    if (items[2].val == 300) { println("PASS: items[2].val"); }
+
+    free(items);
+
+    println("PASS: all array basic tests");
+}

@@ -1,0 +1,59 @@
+// AgamaLang SizeOf Test
+// Tests: sizeof for int, char, bool, struct, array types
+
+struct Vec2 {
+    x: int;
+    y: int;
+}
+
+struct Vec3 {
+    x: int;
+    y: int;
+    z: int;
+}
+
+fn main() {
+    // === Scalar types ===
+    let sz_int: int = sizeof(int);
+    if (sz_int == 4) { println("PASS: sizeof int == 4"); }
+
+    let sz_bool: int = sizeof(bool);
+    if (sz_bool == 4) { println("PASS: sizeof bool == 4"); }
+
+    let sz_char: int = sizeof(char);
+    if (sz_char == 4) { println("PASS: sizeof char == 4"); }
+
+    // === Pointer types ===
+    let sz_ptr: int = sizeof(*int);
+    if (sz_ptr == 8) { println("PASS: sizeof ptr == 8"); }
+
+    let sz_chr_ptr: int = sizeof(*char);
+    if (sz_chr_ptr == 8) { println("PASS: sizeof *char == 8"); }
+
+    // === Struct types ===
+    let sz_vec2: int = sizeof(Vec2);
+    if (sz_vec2 == 8) { println("PASS: sizeof Vec2 == 8"); }
+
+    let sz_vec3: int = sizeof(Vec3);
+    if (sz_vec3 == 12) { println("PASS: sizeof Vec3 == 12"); }
+
+    // === Void type ===
+    let sz_void: int = sizeof(void);
+    if (sz_void == 0) { println("PASS: sizeof void == 0"); }
+
+    // === Sized types ===
+    let sz_upint: int = sizeof(upint);
+    if (sz_upint == 8) { println("PASS: sizeof upint == 8"); }
+
+    let sz_unint: int = sizeof(unint);
+    if (sz_unint == 8) { println("PASS: sizeof unint == 8"); }
+
+    let sz_fixed: int = sizeof(fixed);
+    if (sz_fixed == 8) { println("PASS: sizeof fixed == 8"); }
+
+    // === Pointer to struct ===
+    let sz_pvec: int = sizeof(*Vec2);
+    if (sz_pvec == 8) { println("PASS: sizeof *Vec2 == 8"); }
+
+    println("PASS: all sizeof tests");
+}

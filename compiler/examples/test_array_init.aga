@@ -1,0 +1,22 @@
+// AgamaLang Array Init Test
+// Tests: array literal expressions
+
+fn main() {
+    let a: int[3] = [10, 20, 30];
+    if (a[0] == 10) { println("PASS: array init [0]"); }
+    if (a[1] == 20) { println("PASS: array init [1]"); }
+    if (a[2] == 30) { println("PASS: array init [2]"); }
+
+    let b: int[1] = [42];
+    if (b[0] == 42) { println("PASS: single element array"); }
+
+    let c: int[3] = [1, 2, 3];
+    let sum: int = c[0] + c[1] + c[2];
+    if (sum == 6) { println("PASS: array sum"); }
+
+    let base: int = 100;
+    let d: int[3] = [base, base + 1, base + 2];
+    if (d[1] == 101) { println("PASS: array init with vars"); }
+
+    println("PASS: all array init tests");
+}

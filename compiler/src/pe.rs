@@ -11,37 +11,27 @@ const FA: u32 = 0x200;   // File alignment
 
 fn align_up(v: u32, a: u32) -> u32 { (v + a - 1) & !(a - 1) }
 
-/// Build import data for a single DLL with given function names.
-/// Returns (bytes, iat_rva_start)
-fn build_dll_import(dll: &str, funcs: &[&str], idata_va: u32) -> (Vec<u8>, u32) {
+/// Build import data for a single DLL (ILT + IAT + hint/name + DLL name).
+/// Returns (data_bytes, iat_rva_start, rva_base) where rva_base is the RVA of data_bytes.
+fn build_import_data(dll: &str, funcs: &[&str], data_rva: u32) -> (Vec<u8>, u32) {
     let dll_bytes = dll.as_bytes();
-    let desc_sz = 40u32; // import desc + null desc (20+20)
     let n = funcs.len() as u32;
     let ilt_sz = (n + 1) * 8;
     let iat_sz = ilt_sz;
     let mut hn_sz = 0u32;
     for f in funcs { hn_sz += 2 + f.len() as u32 + 1; }
-    let total = desc_sz + ilt_sz + iat_sz + hn_sz + dll_bytes.len() as u32 + 1;
+    let total = ilt_sz + iat_sz + hn_sz + dll_bytes.len() as u32 + 1;
     let mut buf = vec![0u8; total as usize];
 
-    let ilt_rva = idata_va + desc_sz;
-    let iat_rva = idata_va + desc_sz + ilt_sz;
-    let hn_rva_base = idata_va + desc_sz + ilt_sz + iat_sz;
-    let name_rva = idata_va + desc_sz + ilt_sz + iat_sz + hn_sz;
-    let name_p = name_rva - idata_va;
+    let iat_rva = data_rva + ilt_sz;
 
-    // Import descriptor
-    buf[0..4].copy_from_slice(&(ilt_rva).to_le_bytes());
-    buf[12..16].copy_from_slice(&(name_rva).to_le_bytes());
-    buf[16..20].copy_from_slice(&(iat_rva).to_le_bytes());
-
-    // Hint/name entries + ILT/IAT
-    let mut hn_pos = desc_sz + ilt_sz + iat_sz;
+    // ILT entries
+    let mut hn_pos = ilt_sz + iat_sz;
     for (i, f) in funcs.iter().enumerate() {
         let i_u32 = i as u32;
-        let hn_rva = idata_va + hn_pos;
-        let ilt_p = (desc_sz + i_u32 * 8) as usize;
-        let iat_p = (desc_sz + ilt_sz + i_u32 * 8) as usize;
+        let hn_rva = data_rva + hn_pos;
+        let ilt_p = (i_u32 * 8) as usize;
+        let iat_p = (ilt_sz + i_u32 * 8) as usize;
         buf[ilt_p..ilt_p + 8].copy_from_slice(&(hn_rva as u64).to_le_bytes());
         buf[iat_p..iat_p + 8].copy_from_slice(&(hn_rva as u64).to_le_bytes());
         let hp = hn_pos as usize;
@@ -49,9 +39,8 @@ fn build_dll_import(dll: &str, funcs: &[&str], idata_va: u32) -> (Vec<u8>, u32) 
         buf[hp + 2..hp + 2 + f.len()].copy_from_slice(f.as_bytes());
         hn_pos += 2 + f.len() as u32 + 1;
     }
-
     // DLL name
-    let dp = name_p as usize;
+    let dp = (ilt_sz + iat_sz + hn_sz) as usize;
     buf[dp..dp + dll_bytes.len()].copy_from_slice(dll_bytes);
 
     (buf, iat_rva)
@@ -84,16 +73,42 @@ pub fn write_pe<W: Write>(w: &mut W, unit: &CompiledUnit) -> std::io::Result<()>
         func_order.push(imp.name.clone());
     }
 
-    // Build import data for each DLL, concatenate
+    // Build import data:
+    // 1. Contiguous array of IMAGE_IMPORT_DESCRIPTORs (20 bytes each), terminated by null
+    // 2. Then for each DLL: ILT + IAT + hint/name entries + DLL name
+    let ndlls = dll_map.len();
+    let desc_array_sz = (ndlls + 1) as u32 * 20; // ndlls descriptors + 1 null terminator
+    let mut descriptors = vec![0u8; desc_array_sz as usize];
     let mut imp_data = Vec::new();
-    let mut iat_map: HashMap<String, u32> = HashMap::new(); // func_name -> IAT RVA
-    for (dll, funcs) in &dll_map {
-        let (data, iat_rva) = build_dll_import(dll, funcs, idata_va + imp_data.len() as u32);
+    let mut iat_map: HashMap<String, u32> = HashMap::new();
+
+    for (dll_idx, (dll, funcs)) in dll_map.iter().enumerate() {
+        let n = funcs.len() as u32;
+        let ilt_sz = (n + 1) * 8;
+        let iat_sz = ilt_sz;
+        let mut hn_sz = 0u32;
+        for f in funcs.iter() { hn_sz += 2 + f.len() as u32 + 1; }
+        let data_rva = idata_va + desc_array_sz + imp_data.len() as u32;
+        let (data, iat_rva) = build_import_data(dll, funcs, data_rva);
+        // Fill descriptor in the descriptors array
+        let dp = dll_idx * 20;
+        descriptors[dp..dp + 4].copy_from_slice(&(data_rva).to_le_bytes());      // ILT RVA = start of data
+        let name_rva = data_rva + ilt_sz + iat_sz + hn_sz;
+        descriptors[dp + 12..dp + 16].copy_from_slice(&(name_rva).to_le_bytes()); // Name RVA
+        descriptors[dp + 16..dp + 20].copy_from_slice(&(iat_rva).to_le_bytes());  // IAT RVA
+        // Map function names to IAT entries
         for (i, f) in funcs.iter().enumerate() {
             iat_map.insert(f.to_string(), iat_rva + i as u32 * 8);
         }
         imp_data.extend_from_slice(&data);
     }
+    // Null descriptor already zeroed at end of descriptors array
+
+    // Concatenate: descriptors + data
+    let mut imp_data_full = Vec::new();
+    imp_data_full.extend_from_slice(&descriptors);
+    imp_data_full.extend_from_slice(&imp_data);
+    let imp_data = imp_data_full;
 
     let imp_sz = imp_data.len() as u32;
     let idata_fs = align_up(imp_sz, FA);

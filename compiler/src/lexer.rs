@@ -171,14 +171,47 @@ impl Lexer {
                 }
             }
         }
+        // Check for fixed-point literal (digits.digits or digits,digits)
+        if !is_hex {
+            let decimal_sep = match self.peek() {
+                Some('.') if self.source.get(self.pos + 1).copied().map_or(false, |c| c.is_ascii_digit()) => Some('.'),
+                Some(',') if self.source.get(self.pos + 1).copied().map_or(false, |c| c.is_ascii_digit()) => Some(','),
+                _ => None,
+            };
+            if let Some(sep) = decimal_sep {
+                self.advance(); // consume '.' or ','
+                s.push(sep);
+                while let Some(ch) = self.peek() {
+                    if ch.is_ascii_digit() {
+                        s.push(ch);
+                        self.advance();
+                    } else {
+                        break;
+                    }
+                }
+                // Parse as Q16.16 (always use '.' internally)
+                let int_part: i64 = {
+                    let s_int = s.split(|c: char| c == '.' || c == ',').next().unwrap_or("0");
+                    s_int.parse().unwrap_or(0)
+                };
+                let frac_str = s.split(|c: char| c == '.' || c == ',').nth(1).unwrap_or("");
+                let frac_padded = format!("{:0<5}", frac_str);
+                let frac_digits: i64 = frac_padded[..5].parse().unwrap_or(0);
+                let q = (int_part << 16) as i64 + (frac_digits * 65536 / 100000);
+                return TokenKind::Fixed(q);
+            }
+        }
         let n: i64 = if is_hex {
             if s.len() > 2 {
-                i64::from_str_radix(&s[2..], 16).unwrap_or(0)
+                i64::from_str_radix(&s[2..], 16).unwrap_or(i64::MAX)
             } else {
                 0
             }
         } else {
-            s.parse().unwrap_or(0)
+            s.parse::<i64>().unwrap_or_else(|_| {
+                eprintln!("Warning: integer literal '{}' overflows i64, capping at {}", s, i64::MAX);
+                i64::MAX
+            })
         };
         TokenKind::Integer(n)
     }
@@ -211,10 +244,14 @@ impl Lexer {
             "break" => TokenKind::Break,
             "continue" => TokenKind::Continue,
             "sizeof" => TokenKind::SizeOf,
+            "eat" => TokenKind::Eat,
             "int" => TokenKind::IntType,
             "char" => TokenKind::CharType,
             "bool" => TokenKind::BoolType,
             "void" => TokenKind::VoidType,
+            "upint" => TokenKind::UpIntType,
+            "unint" => TokenKind::UnIntType,
+            "fixed" => TokenKind::FixedType,
             _ => TokenKind::Identifier(s),
         }
     }

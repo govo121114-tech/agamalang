@@ -62,10 +62,18 @@ impl Parser {
                 }
                 TokenKind::Let => {
                     // Top-level let declarations (global constants)
-                    // Skip them — they are processed as regular variable decls
-                    // inside the codegen based on symbol table.
-                    // For now, just parse and discard.
                     let _ = self.parse_variable_decl();
+                }
+                TokenKind::Eat => {
+                    self.advance(); // consume eat
+                    let lib = match self.advance().kind.clone() {
+                        TokenKind::Identifier(n) => n,
+                        _ => {
+                            eprintln!("Error: expected library name after 'eat' at line {}", self.peek().line);
+                            String::new()
+                        }
+                    };
+                    program.imports.push(lib);
                 }
                 _ => {
                     eprintln!(
@@ -183,6 +191,9 @@ impl Parser {
                 TokenKind::CharType => Type::Char,
                 TokenKind::BoolType => Type::Bool,
                 TokenKind::VoidType => Type::Void,
+                TokenKind::UpIntType => Type::UpInt,
+                TokenKind::UnIntType => Type::UnInt,
+                TokenKind::FixedType => Type::Fixed,
                 TokenKind::Identifier(name) => Type::Named(name),
                 _ => {
                     eprintln!("Error: expected type at line {}", self.peek().line);
@@ -318,15 +329,8 @@ impl Parser {
                 self.advance();
             }
             if matches!(self.peek_kind(), TokenKind::If) {
-                // else if
-                let else_if = self.parse_if();
-                match else_if {
-                    Stmt::If { condition, then_branch, else_branch: _ } => {
-                        // Wrap in block
-                        Some(vec![Stmt::If { condition, then_branch, else_branch: None }])
-                    }
-                    _ => Some(vec![else_if]),
-                }
+                // else if — preserve entire chain including its own else_branch
+                Some(vec![self.parse_if()])
             } else {
                 Some(self.parse_block())
             }
@@ -622,8 +626,9 @@ impl Parser {
 
     fn parse_primary(&mut self) -> Expr {
         let tok = self.advance().clone();
-        match tok.kind {
+        let mut expr = match tok.kind {
             TokenKind::Integer(n) => Expr::Integer(n),
+            TokenKind::Fixed(n) => Expr::Fixed(n),
             TokenKind::String(s) => Expr::String(s),
             TokenKind::CharLiteral(c) => Expr::Char(c),
             TokenKind::True => Expr::Bool(true),
@@ -636,7 +641,6 @@ impl Parser {
                 Expr::SizeOf(ty)
             }
             TokenKind::LBracket => {
-                // Array literal: [expr, expr, ...]
                 let mut elems = Vec::new();
                 if !matches!(self.peek_kind(), TokenKind::RBracket) {
                     loop {
@@ -652,11 +656,9 @@ impl Parser {
                 Expr::ArrayInit(elems)
             }
             TokenKind::Identifier(name) => {
-                // Check for struct init: TypeName { field: expr; ... }
                 if matches!(self.peek_kind(), TokenKind::LBrace) {
                     return self.parse_struct_init(name);
                 }
-                // Check for function call: name(...)
                 if matches!(self.peek_kind(), TokenKind::LParen) {
                     self.advance();
                     let mut args = Vec::new();
@@ -673,34 +675,12 @@ impl Parser {
                     self.expect(&TokenKind::RParen);
                     return Expr::Call { callee: name, args };
                 }
-                // Build base expression, then chain postfix ops: .field and [index]
-                let mut expr = Expr::Identifier(name);
-                loop {
-                    if matches!(self.peek_kind(), TokenKind::Dot) {
-                        self.advance();
-                        let member = match self.advance().kind.clone() {
-                            TokenKind::Identifier(m) => m,
-                            _ => {
-                                eprintln!("Error: expected member name at line {}", self.peek().line);
-                                String::new()
-                            }
-                        };
-                        expr = Expr::Member { object: Box::new(expr), member };
-                    } else if matches!(self.peek_kind(), TokenKind::LBracket) {
-                        self.advance();
-                        let index = self.parse_expr();
-                        self.expect(&TokenKind::RBracket);
-                        expr = Expr::Index { object: Box::new(expr), index: Box::new(index) };
-                    } else {
-                        break;
-                    }
-                }
-                expr
+                Expr::Identifier(name)
             }
             TokenKind::LParen => {
-                let expr = self.parse_expr();
+                let e = self.parse_expr();
                 self.expect(&TokenKind::RParen);
-                expr
+                e
             }
             _ => {
                 eprintln!(
@@ -709,7 +689,29 @@ impl Parser {
                 );
                 Expr::Integer(0)
             }
+        };
+        // Chain postfix ops: .field and [index] for any expression
+        loop {
+            if matches!(self.peek_kind(), TokenKind::Dot) {
+                self.advance();
+                let member = match self.advance().kind.clone() {
+                    TokenKind::Identifier(m) => m,
+                    _ => {
+                        eprintln!("Error: expected member name at line {}", self.peek().line);
+                        String::new()
+                    }
+                };
+                expr = Expr::Member { object: Box::new(expr), member };
+            } else if matches!(self.peek_kind(), TokenKind::LBracket) {
+                self.advance();
+                let index = self.parse_expr();
+                self.expect(&TokenKind::RBracket);
+                expr = Expr::Index { object: Box::new(expr), index: Box::new(index) };
+            } else {
+                break;
+            }
         }
+        expr
     }
 
     fn parse_struct_init(&mut self, type_name: String) -> Expr {

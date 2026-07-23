@@ -65,11 +65,13 @@ function Ensure-Compiler {
 function Build-Aga {
   param([string]$SrcFile, [string]$OutName)
 
-  # Auto-search in examples/ if file not found directly
-  if (-not (Test-Path -LiteralPath $SrcFile -PathType Leaf)) {
+  # Resolve to absolute path BEFORE changing directory
+  if (Test-Path -LiteralPath $SrcFile -PathType Leaf) {
+    $SrcFile = (Resolve-Path -LiteralPath $SrcFile).Path
+  } else {
     $inExamples = Join-Path (Join-Path $ProjectRoot "examples") $SrcFile
     if (Test-Path -LiteralPath $inExamples -PathType Leaf) {
-      $SrcFile = $inExamples
+      $SrcFile = (Resolve-Path -LiteralPath $inExamples).Path
     } else {
       Step "FAIL: file not found: $SrcFile" Red
       exit 1

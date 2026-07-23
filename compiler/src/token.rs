@@ -19,15 +19,20 @@ pub enum TokenKind {
     Break,      // break
     Continue,   // continue
     SizeOf,     // sizeof
+    Eat,        // eat
 
     // Types
     IntType,    // int
     CharType,   // char
     BoolType,   // bool
     VoidType,   // void
+    UpIntType,  // upint
+    UnIntType,  // unint
+    FixedType,  // fixed
 
     // Literals
     Integer(i64),
+    Fixed(i64),     // Q16.16 fixed-point
     String(String),
     CharLiteral(u8),
     Identifier(String),
@@ -100,11 +105,20 @@ impl fmt::Display for TokenKind {
             TokenKind::Break => write!(f, "break"),
             TokenKind::Continue => write!(f, "continue"),
             TokenKind::SizeOf => write!(f, "sizeof"),
+            TokenKind::Eat => write!(f, "eat"),
             TokenKind::IntType => write!(f, "int"),
             TokenKind::CharType => write!(f, "char"),
             TokenKind::BoolType => write!(f, "bool"),
             TokenKind::VoidType => write!(f, "void"),
+            TokenKind::UpIntType => write!(f, "upint"),
+            TokenKind::UnIntType => write!(f, "unint"),
+            TokenKind::FixedType => write!(f, "fixed"),
             TokenKind::Integer(n) => write!(f, "{}", n),
+            TokenKind::Fixed(n) => {
+                let int_part = *n >> 16;
+                let frac_part = (*n as u64 & 0xFFFF) * 100000 / 65536;
+                write!(f, "{}.{:05}", int_part, frac_part)
+            }
             TokenKind::String(s) => write!(f, "\"{}\"", s),
             TokenKind::CharLiteral(c) => write!(f, "'{}'", *c as char),
             TokenKind::Identifier(s) => write!(f, "{}", s),

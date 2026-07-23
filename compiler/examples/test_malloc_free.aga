@@ -1,0 +1,57 @@
+// AgamaLang Malloc/Free Test
+// Tests: heap allocation, freeing, multiple allocations, null checks
+
+struct Item {
+    id: int;
+    name: *char;
+}
+
+fn main() {
+    // === Basic malloc and free ===
+    let p: *int = malloc(4);
+    if (p != 0) { println("PASS: malloc returns non-null"); }
+
+    *p = 42;
+    if (*p == 42) { println("PASS: write and read through malloc"); }
+
+    free(p);
+    println("PASS: free basic");
+
+    // === Multiple allocations ===
+    let a: *int = malloc(4);
+    let b: *int = malloc(4);
+    let c: *int = malloc(4);
+
+    *a = 1;
+    *b = 2;
+    *c = 3;
+
+    if (*a == 1 && *b == 2 && *c == 3) {
+        println("PASS: multiple allocations independent");
+    }
+
+    free(a);
+    free(b);
+    free(c);
+
+    // === Larger allocations ===
+    let big: *int = malloc(1000);
+    if (big != 0) { println("PASS: large allocation"); }
+    big[0] = 123;
+    big[249] = 456;
+    if (big[0] == 123) { println("PASS: large array [0]"); }
+    if (big[249] == 456) { println("PASS: large array [249]"); }
+    free(big);
+
+    // === Zero-sized allocation ===
+    let zp: *int = malloc(0);
+    println("PASS: zero-size malloc");
+
+    // === Allocate for struct ===
+    let item: *Item = malloc(sizeof(Item));
+    item.id = 55;
+    if (item.id == 55) { println("PASS: malloc struct"); }
+    free(item);
+
+    println("PASS: all malloc/free tests");
+}

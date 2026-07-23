@@ -1,0 +1,21 @@
+// AgamaLang Command Line Test
+// Tests: command line argument reading via cmdline() intrinsic
+
+fn main() {
+    let cmd: *char = cmdline();
+    // cmdline returns pointer to the command line string
+    // We can read the first few bytes to verify it's non-null
+
+    if (cmd != 0) {
+        println("PASS: cmdline returns non-null");
+    } else {
+        println("FAIL: cmdline null");
+    }
+
+    // Print first char of command line just to test access
+    let first: int = cmd[0];
+    // Should be 'c' from "compiler\..." or path to our exe
+    println("PASS: cmdline first byte is readable");
+
+    println("PASS: cmdline test");
+}

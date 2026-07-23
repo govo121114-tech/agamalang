@@ -1,29 +1,42 @@
 # AgamaLang — Agents Guide
 
+## ⚠️ HARD RULE: Always use Context7 on every query
+
+You MUST call Context7 MCP tools (`resolve-library-id` + `query-docs`) on **every user query** that involves **any** library, API, framework, programming language, tool, SDK, or external service — even if you think you know the answer. This includes Rust, Win32, Windows API, Cargo, and any library mentioned in conversation.
+
+Use `resolve-library-id` first to find the correct library ID, then `query-docs` with the user's question. Do not skip this step. If Context7 has no docs for a library, only then fall back to your own knowledge.
+
+Rationale: Context7 provides up-to-date, version-specific documentation. Your training data may be outdated or contain hallucinated APIs.
+
 Compiler for a mid-level C-like language (agamalang), written in Rust, generating x86-64 PE .exe for Windows directly (no assembler/linker).
 
 ## Build & run
 
 ```powershell
+cd compiler
 cargo build
-cargo run -- examples\exit.aga          # → exit.exe
-cargo run -- examples\hello.aga         # → hello.exe (uses print/println)
+cargo run -- examples\exit.aga          # → exit.exe in compiler/
+cargo run -- examples\hello.aga         # → hello.exe in compiler/
 cargo run -- examples\file.aga out.exe  # custom output name
 ```
 
-Output `.exe` lands in current directory (not examples/). No tests yet.
+Output `.exe` lands in compiler/ (current directory, not examples/). No tests yet.
 
 ## Source architecture (7 files, single crate)
 
+Source lives in `compiler/`:
 ```
-main.rs      — orchestrates phases: read → lex → parse → codegen → pe_write
-token.rs     — TokenKind enum
-lexer.rs     — Lexer::tokenize() → Vec<Token>
-ast.rs       — Program → Function → Stmt / Expr
-parser.rs    — Parser::parse() → Program, recursive-descent, Newline as statement separator
-codegen.rs   — Generator → CompiledUnit (raw bytes + relocation metadata)
-pe.rs        — write_pe() → .exe file (no external linker needed)
-pedump/      — separate utility (cargo run -- <file>) for PE hex inspection
+compiler/
+├── src/main.rs      — orchestrates phases: read → lex → parse → codegen → pe_write
+├── src/token.rs     — TokenKind enum
+├── src/lexer.rs     — Lexer::tokenize() → Vec<Token>
+├── src/ast.rs       — Program → Function → Stmt / Expr
+├── src/parser.rs    — Parser::parse() → Program, recursive-descent, Newline as statement separator
+├── src/codegen.rs   — Generator → CompiledUnit (raw bytes + relocation metadata)
+├── src/pe.rs        — write_pe() → .exe file (no external linker needed)
+├── examples/        — .aga test files
+├── pedump/          — separate utility (cargo run -- <file>) for PE hex inspection
+└── Cargo.toml       — no dependencies
 ```
 
 ## Language surface (parsed & codegen'd)
@@ -89,6 +102,7 @@ pedump/      — separate utility (cargo run -- <file>) for PE hex inspection
 ## Expected output (smoke test)
 
 ```powershell
+cd compiler
 cargo run -- examples\exit.aga
 .\exit.exe; echo $LASTEXITCODE
 # → 0
@@ -104,18 +118,55 @@ cargo run -- examples\hello.aga
 
 Compiler emits ~10 warnings about unused fields/variables (`column`, `var_type`, `return_type`, `imports`, etc.). These are leftover from incomplete features (structs, enums, member access) and can be ignored for now.
 
-## File layout
+## Fixed bugs (Phase 2)
+
+1. **B4: Index element size** — `compile_expr_to` for Index now dereferences to return the VALUE; `compile_expr_addr` for Index no longer dereferences (returns ADDRESS). Previously they were swapped, causing crashes on `ptr[i]` and `arr[i]` assignments/reads.
+
+2. **B26: `type_size(Named)`** — now takes `&HashMap<String, StructLayout>` parameter and returns actual struct size via `struct_size()`. All 9 call sites updated.
+
+3. **B22: Signed loads** — `mov_r64_m32` uses `movsxd` (sign-extend with REX.W=1, opcode 0x63) for correct signed int comparisons.
+
+4. **B24: StructInit store width** — uses `field_size()` to determine 4-byte vs 8-byte stores.
+
+5. **B7: Deref load size** — `compile_expr_to(Deref)` checks pointed-to type size for 1/4/8 byte loads.
+
+6. **B9: Return stack** — `Return` now uses return value as `ExitProcess` argument instead of `emit_print_int`.
+
+7. **B5: `resolve_struct_name` for Member chains** — traverses `Member` chains and handles `Ptr(Named)`.
+
+8. **Parser: postfix chaining** — `[index]` and `.field` now apply to any expression, not just identifiers.
+
+## All 18 tests pass
 
 ```
-agamalang/
-├── src/main.rs          # CLI entry
-├── src/token.rs         # TokenKind enum
-├── src/lexer.rs         # tokenize()
-├── src/ast.rs           # AST nodes
-├── src/parser.rs        # recursive-descent parser
-├── src/codegen.rs       # x86-64 code generator
-├── src/pe.rs            # PE .exe writer
-├── examples/            # .aga test files
-├── pedump/              # standalone PE dump tool
-└── Cargo.toml           # no dependencies
+cargo run -- examples/exit.aga && exit.exe         # → 0
+cargo run -- examples/hello.aga && hello.exe        # → "Hello from AgamaLang!" ...
+cargo run -- examples/test_struct_basic.aga && ...  # → all struct tests pass
+cargo run -- examples/test_member_access.aga && ... # → all member tests pass
+cargo run -- examples/test_array_basic.aga && ...   # → all array tests pass
+cargo run -- examples/test_array_init.aga && ...    # → all array init tests pass
+cargo run -- examples/test_sizeof.aga && ...        # → all sizeof tests pass
+cargo run -- examples/test_malloc_free.aga && ...   # → all malloc/free tests pass
+cargo run -- examples/test_cmdline.aga && ...       # → all cmdline tests pass
+```
+
+All return EXIT: 0.
+
+## Project layout
+
+```
+agamalang/               # project root
+├── ai/                  # AI agents, hints, and config
+│   └── AGENTS.md        # this file
+├── compiler/            # AgamaLang compiler and language
+│   ├── src/             # Rust source (7 files)
+│   ├── examples/        # .aga test programs
+│   ├── pedump/          # PE dump utility
+│   ├── Cargo.toml       # no external dependencies
+│   └── Cargo.lock
+└── .opencode/           # opencode configuration
+    ├── opencode.json
+    └── agents/
+        ├── libwriter.md
+        └── compiler-opt.md
 ```

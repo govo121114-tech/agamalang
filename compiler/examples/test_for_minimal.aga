@@ -1,0 +1,8 @@
+fn main() {
+    let x: int = 0;
+    for (let i: int = 0; i < 3; i = i + 1) {
+        x = x + 1;
+    }
+    // Should print "3" if for loops work
+    println(x);
+}

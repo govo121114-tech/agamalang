@@ -1,0 +1,42 @@
+// AgamaLang Member Access Test
+// Tests: struct member read/write (no nested structs — B26: type_size returns 4 for Named)
+// NOTE: type_size for Named types returns 4 (placeholder, B26), making structs-with-structs broken.
+// Only single-level struct accesses are tested here.
+
+struct Point {
+    x: int;
+    y: int;
+}
+
+fn main() {
+    // === Struct member read ===
+    let p: Point = Point {
+        x: 10;
+        y: 20;
+    };
+
+    let px: int = p.x;
+    if (px == 10) { println("PASS: Point.x read"); }
+
+    let py: int = p.y;
+    if (py == 20) { println("PASS: Point.y read"); }
+
+    // === Struct field write ===
+    p.x = 100;
+    if (p.x == 100) { println("PASS: Point.x write"); }
+    if (p.y == 20) { println("PASS: Point.y unchanged"); }
+
+    // === Multiple structs independent ===
+    let p2: Point = Point {
+        x: 5;
+        y: 15;
+    };
+    if (p2.x == 5) { println("PASS: p2.x"); }
+    if (p2.y == 15) { println("PASS: p2.y"); }
+
+    // === sizeof Point ===
+    let sz: int = sizeof(Point);
+    if (sz == 8) { println("PASS: sizeof Point == 8"); }
+
+    println("PASS: all member access tests");
+}

@@ -21,14 +21,15 @@ pub struct CompiledUnit {
 }
 
 /// Compute the size of a type for layout (4 for int/char/bool, 8 for pointers)
-fn type_size(ty: &Type) -> i32 {
+fn type_size(ty: &Type, layouts: &HashMap<String, StructLayout>) -> i32 {
     match ty {
         Type::Int | Type::Char | Type::Bool => 4,
+        Type::UpInt | Type::UnInt | Type::Fixed => 8,
         Type::Ptr(_) => 8,
-        Type::Array(_) => 8, // pointer to array (or array descriptor)
+        Type::Array(_) => 8,
         Type::Void => 0,
-        Type::StaticArray(elem, n) => type_size(elem) * (*n as i32),
-        Type::Named(name) => 4, // placeholder; struct layout has actual size
+        Type::StaticArray(elem, n) => type_size(elem, layouts) * (*n as i32),
+        Type::Named(name) => layouts.get(name).map(|l| l.size).unwrap_or(4),
     }
 }
 
@@ -57,20 +58,37 @@ fn get_member_field_size(
     object: &Expr,
     member: &str,
 ) -> i32 {
-    if let Some(sname) = resolve_struct_name(object, var_types) {
+    if let Some(sname) = resolve_struct_name(object, var_types, layouts) {
         return field_size(sname, member, layouts).unwrap_or(8);
     }
     8
 }
 
-/// Resolve the struct name from an expression (Identifier or Index into *Struct)
-fn resolve_struct_name<'a>(expr: &Expr, var_types: &'a HashMap<String, Type>) -> Option<&'a str> {
+/// Resolve the struct name from an expression, looking up through var_types for
+/// Identifiers (including pointer-to-struct) and through struct field types for Member chains.
+fn resolve_struct_name<'a>(expr: &Expr, var_types: &'a HashMap<String, Type>, layouts: &'a HashMap<String, StructLayout>) -> Option<&'a str> {
     match expr {
         Expr::Identifier(name) => {
-            if let Some(Type::Named(n)) = var_types.get(name) {
-                return Some(n.as_str());
+            match var_types.get(name) {
+                Some(Type::Named(n)) => return Some(n.as_str()),
+                Some(Type::Ptr(inner)) => {
+                    if let Type::Named(n) = inner.as_ref() {
+                        return Some(n.as_str());
+                    }
+                }
+                _ => {}
             }
             None
+        }
+        Expr::Member { object, member } => {
+            let parent = resolve_struct_name(object, var_types, layouts)?;
+            let layout = layouts.get(parent)?;
+            let field = layout.fields.iter().find(|f| f.name == *member)?;
+            if let Type::Named(ref n) = field.field_type {
+                Some(n.as_str())
+            } else {
+                None
+            }
         }
         Expr::Index { object, .. } => {
             if let Expr::Identifier(oname) = object.as_ref() {
@@ -95,7 +113,7 @@ fn get_ptr_elem_size(expr: &Expr, var_types: &HashMap<String, Type>, layouts: &H
                 Type::Named(n) => struct_size(n, layouts),
                 _ => 4,
             },
-            Some(Type::Array(inner)) | Some(Type::StaticArray(inner, _)) => type_size(inner),
+            Some(Type::Array(inner)) | Some(Type::StaticArray(inner, _)) => type_size(inner, layouts),
             _ => 4,
         }
     } else { 4 }
@@ -104,23 +122,35 @@ fn get_ptr_elem_size(expr: &Expr, var_types: &HashMap<String, Type>, layouts: &H
 /// Compile a program and return the compiled unit
 pub fn compile(program: &Program) -> CompiledUnit {
     let mut gen = Generator::new();
-    // Build struct layouts
-    for sd in &program.structs {
-        let mut fields = Vec::new();
-        let mut offset: i32 = 0;
-        for (fname, ftype) in &sd.fields {
-            let fsz = type_size(&ftype);
-            fields.push(StructField {
-                name: fname.clone(),
-                offset,
-                size: fsz,
+        // Build struct layouts
+        for sd in &program.structs {
+            let mut fields = Vec::new();
+            let mut offset: i32 = 0;
+            for (fname, ftype) in &sd.fields {
+                let fsz = type_size(&ftype, &gen.struct_layouts);
+                fields.push(StructField {
+                    name: fname.clone(),
+                    offset,
+                    size: fsz,
+                    field_type: ftype.clone(),
+                });
+                offset += fsz;
+            }
+            gen.struct_layouts.insert(sd.name.clone(), StructLayout {
+                size: offset,
+                fields,
             });
-            offset += fsz;
         }
-        gen.struct_layouts.insert(sd.name.clone(), StructLayout {
-            size: offset,
-            fields,
-        });
+    for imp in &program.imports {
+        if imp == "math" {
+            gen.has_math = true;
+        }
+        if imp == "gdi" {
+            gen.has_gdi = true;
+        }
+    }
+    if gen.has_gdi {
+        gen.register_gdi_imports();
     }
     gen.compile_program(program);
     gen.finalize()
@@ -131,6 +161,7 @@ struct StructField {
     name: String,
     offset: i32,
     size: i32,
+    field_type: Type,
 }
 
 #[derive(Clone)]
@@ -158,6 +189,8 @@ struct Generator {
     current_fn: String,
     loop_break_labels: Vec<u32>,  // stack of break-target labels
     loop_continue_labels: Vec<u32>, // stack of continue-target labels
+    has_math: bool,
+    has_gdi: bool,
 }
 
 impl Generator {
@@ -181,6 +214,8 @@ impl Generator {
             current_fn: String::new(),
             loop_break_labels: Vec::new(),
             loop_continue_labels: Vec::new(),
+            has_math: false,
+            has_gdi: false,
         }
     }
 
@@ -278,8 +313,9 @@ impl Generator {
     }
 
     fn mov_r64_m32(&mut self, dst: u8, base: u8, off: i32) {
-        self.rex(false, dst >= 8, false, base >= 8); // 32-bit load, zero-extends
-        self.u8(0x8B);
+        // Sign-extend 32-bit load (movsxd): `int` is signed, comparisons must be correct
+        self.rex(true, dst >= 8, false, base >= 8);
+        self.u8(0x63);
         self.encode_addr(dst, base, off);
     }
 
@@ -470,10 +506,11 @@ impl Generator {
         // Store parameters
         let param_regs = [1, 2, 8, 9]; // RCX, RDX, R8, R9
         for (i, p) in func.params.iter().enumerate() {
-            let psz = type_size(&p.param_type).max(4) as u32;
+            let psz = type_size(&p.param_type, &self.struct_layouts).max(4) as u32;
             self.stack_size += psz.max(8); // minimum 8-byte slot to avoid overlap
             let off = -(self.stack_size as i32);
             self.vars.insert(p.name.clone(), off);
+            self.var_types.insert(p.name.clone(), p.param_type.clone());
             if i < 4 {
                 if psz == 4 {
                     self.mov_m32_r64(5, off, param_regs[i]);
@@ -487,16 +524,32 @@ impl Generator {
         // Must be multiple of 16 to keep RSP ≡ 0 (mod 16) after push rbp
         let max_var_stack: u32 = {
             let mut sz = 8u32;
-            for stmt in &func.body {
-                if let Stmt::VariableDecl { var_type, .. } = stmt {
-                    let vs = match var_type {
-                        Some(Type::Named(n)) => struct_size(n, &self.struct_layouts).max(4) as u32,
-                        Some(ty) => type_size(ty).max(4) as u32,
-                        None => 4,
-                    };
-                    sz += vs.max(8); // minimum 8-byte slot to avoid 8-byte store overlap
+            fn count_vardecls(stmts: &[Stmt], layouts: &HashMap<String, StructLayout>, sz: &mut u32) {
+                for stmt in stmts {
+                    match stmt {
+                        Stmt::VariableDecl { var_type, .. } => {
+                            let vs = match var_type {
+                                Some(Type::Named(n)) => struct_size(n, layouts).max(4) as u32,
+                            Some(ty) => type_size(ty, layouts).max(4) as u32,
+                            None => 4,
+                        };
+                        *sz += vs.max(8);
+                    }
+                    Stmt::Block(stmts) => count_vardecls(stmts, layouts, sz),
+                        Stmt::If { then_branch, else_branch, .. } => {
+                            count_vardecls(then_branch, layouts, sz);
+                            if let Some(stmts) = else_branch { count_vardecls(stmts, layouts, sz); }
+                        }
+                        Stmt::While { body, .. } => count_vardecls(body, layouts, sz),
+                        Stmt::For { init, body, .. } => {
+                            count_vardecls(std::slice::from_ref(init.as_ref()), layouts, sz);
+                            count_vardecls(body, layouts, sz);
+                        }
+                        _ => {}
+                    }
                 }
             }
+            count_vardecls(&func.body, &self.struct_layouts, &mut sz);
             // Use full sz to cover the last variable's complete extent
             let needed = sz;
             ((needed + 15) & !15).max(0x20)
@@ -532,8 +585,15 @@ impl Generator {
                 }
             }
             Expr::Member { object, member } => {
-                self.compile_expr_addr(object, reg);
-                if let Some(sname) = resolve_struct_name(object, &self.var_types) {
+                // If object is a pointer to struct, load the pointer value first
+                let is_ptr = matches!(object.as_ref(), Expr::Identifier(oname)
+                    if self.var_types.get(oname).map_or(false, |t| matches!(t, Type::Ptr(_))));
+                if is_ptr {
+                    self.compile_expr_to(object, reg);
+                } else {
+                    self.compile_expr_addr(object, reg);
+                }
+                if let Some(sname) = resolve_struct_name(object, &self.var_types, &self.struct_layouts) {
                     if let Some(foff) = field_offset(sname, member, &self.struct_layouts) {
                         if foff != 0 { self.add_rm64_imm8(reg, foff as i8); }
                     }
@@ -542,23 +602,24 @@ impl Generator {
             Expr::Index { object, index } => {
                 let is_ptr = matches!(object.as_ref(), Expr::Identifier(oname)
                     if self.var_types.get(oname).map_or(false, |t| matches!(t, Type::Ptr(_))));
-                let elem_size = if is_ptr {
-                    get_ptr_elem_size(object, &self.var_types, &self.struct_layouts)
-                } else { 4 };
+                let elem_size = get_ptr_elem_size(object, &self.var_types, &self.struct_layouts);
                 if is_ptr {
-                    self.compile_expr_to(object, reg);
+                    self.compile_expr_to(object, 0);
                 } else {
-                    self.compile_expr_addr(object, reg);
+                    self.compile_expr_addr(object, 0);
                 }
-                self.push_r64(reg);
-                self.compile_expr_to(index, 0);
+                self.push_r64(0);
+                self.compile_expr_to(index, 1);
+                self.pop_r64(0);
                 if elem_size != 1 {
-                    self.mov_r64_imm32(1, elem_size as u32);
-                    self.imul_r64(0, 1);
+                    self.mov_r64_imm32(2, elem_size as u32);
+                    self.imul_r64(1, 2);
                 }
-                self.pop_r64(1);
-                self.add_r64(1, 0);
-                if reg != 1 { self.mov_r64_r64(reg, 1); }
+                self.add_r64(0, 1);
+                if reg != 0 { self.mov_r64_r64(reg, 0); }
+            }
+            Expr::Unary { op: UnOp::Deref, operand } => {
+                self.compile_expr_to(operand, reg);
             }
             _ => {}
         }
@@ -570,7 +631,7 @@ impl Generator {
             Stmt::VariableDecl { name, var_type, init } => {
                 let var_sz = match var_type {
                     Some(Type::Named(n)) => struct_size(n, &self.struct_layouts).max(4),
-                    Some(ty) => type_size(ty).max(4),
+                    Some(ty) => type_size(ty, &self.struct_layouts).max(4),
                     None => 4,
                 };
                 self.stack_size += (var_sz as u32).max(8); // minimum 8-byte slot
@@ -584,7 +645,6 @@ impl Generator {
                     if let Expr::StructInit { type_name: _, fields } = e {
                         for (fname, fval) in fields {
                             self.compile_expr_to(fval, 0);
-                            // Compute field offset from struct type
                             if let Some(ty) = var_type {
                                 if let Type::Named(struct_name) = ty {
                                     if let Some(fsz) = field_size(struct_name, fname, &self.struct_layouts) {
@@ -599,8 +659,18 @@ impl Generator {
                                 }
                             }
                         }
+                    } else if let Expr::ArrayInit(elems) = e {
+                        // Inline array init: store each element at the variable's stack offset
+                        for (i, elem) in elems.iter().enumerate() {
+                            self.compile_expr_to(elem, 0);
+                            self.mov_m32_r64(5, off + i as i32 * 4, 0);
+                        }
                     } else {
                         self.compile_expr_to(e, 0);
+                        // For unint, negate the value (unint always stores negative)
+                        if matches!(var_type, Some(Type::UnInt)) {
+                            self.neg_r64();
+                        }
                         // Use appropriate store width based on type
                         let is_4byte = match var_type {
                             Some(Type::Int | Type::Char | Type::Bool) => true,
@@ -615,9 +685,15 @@ impl Generator {
                 }
             }
             Stmt::Return { value } => {
-                if let Some(e) = value { self.compile_expr_to(e, 0); }
+                if let Some(e) = value {
+                    self.compile_expr_to(e, 0);
+                }
                 if self.current_fn == "main" {
-                    self.xor_r64(1, 1);
+                    if value.is_some() {
+                        self.mov_r64_r64(1, 0);
+                    } else {
+                        self.xor_r64(1, 1);
+                    }
                     self.emit_import_call("ExitProcess");
                 }
                 self.mov_r64_r64(4, 5); self.pop_r64(5); self.ret();
@@ -659,8 +735,9 @@ impl Generator {
             Stmt::For { init, condition, post, body } => {
                 self.compile_stmt(init);
                 let loop_lbl = self.new_label();
+                let continue_lbl = self.new_label();
                 let end_lbl = self.new_label();
-                self.loop_continue_labels.push(loop_lbl);
+                self.loop_continue_labels.push(continue_lbl);
                 self.loop_break_labels.push(end_lbl);
                 self.put_label(loop_lbl);
                 if let Some(c) = condition {
@@ -670,16 +747,13 @@ impl Generator {
                     self.add_label_fixup(self.asm.len() as u32 - 4, end_lbl, true);
                 }
                 for s in body { self.compile_stmt(s); }
-                if let Some(p) = post { self.compile_expr_to(p, 0); }
-                // Continue jumps here (before post! — standard for loop semantics)
-                self.put_label(*self.loop_continue_labels.last().unwrap());
-                self.loop_continue_labels.pop();
+                self.put_label(continue_lbl);
                 if let Some(p) = post { self.compile_expr_to(p, 0); }
                 self.jmp_rel32();
                 self.add_label_fixup(self.asm.len() as u32 - 4, loop_lbl, true);
                 self.put_label(end_lbl);
+                self.loop_continue_labels.pop();
                 self.loop_break_labels.pop();
-                // For loop's continue label was already popped above
             }
             Stmt::Break => {
                 if let Some(&end_lbl) = self.loop_break_labels.last() {
@@ -704,6 +778,9 @@ impl Generator {
                 } else {
                     self.mov_r64_imm64(reg, *n as u64);
                 }
+            }
+            Expr::Fixed(n) => {
+                self.mov_r64_imm64(reg, *n as u64);
             }
             Expr::Bool(b) => { self.mov_r64_imm32(reg, if *b { 1 } else { 0 }); }
             Expr::Char(c) => { self.mov_r64_imm32(reg, *c as u32); }
@@ -781,7 +858,18 @@ impl Generator {
                     }
                     UnOp::Deref => {
                         self.compile_expr_to(operand, 0);
-                        self.mov_r64_m64(reg, 0, 0);
+                        let elem_size = if let Expr::Identifier(oname) = operand.as_ref() {
+                            if let Some(Type::Ptr(inner)) = self.var_types.get(oname) {
+                                type_size(inner, &self.struct_layouts)
+                            } else { 8 }
+                        } else { 8 };
+                        if elem_size == 1 {
+                            self.movzx_r64(reg, 0, 0);
+                        } else if elem_size == 4 {
+                            self.mov_r64_m32(reg, 0, 0);
+                        } else {
+                            self.mov_r64_m64(reg, 0, 0);
+                        }
                     }
                 }
             }
@@ -807,9 +895,16 @@ impl Generator {
                     }
                     Expr::Member { object, member } => {
                         self.push_r64(0); // save value
-                        self.compile_expr_addr(object, 1); // R1 = struct address
+                        // For pointer types, load pointer value; otherwise get struct address
+                        let is_ptr = matches!(object.as_ref(), Expr::Identifier(oname)
+                            if self.var_types.get(oname).map_or(false, |t| matches!(t, Type::Ptr(_))));
+                        if is_ptr {
+                            self.compile_expr_to(object, 1);
+                        } else {
+                            self.compile_expr_addr(object, 1);
+                        }
                         let fsz = get_member_field_size(&self.var_types, &self.struct_layouts, object, member);
-                        if let Some(sname) = resolve_struct_name(object, &self.var_types) {
+                        if let Some(sname) = resolve_struct_name(object, &self.var_types, &self.struct_layouts) {
                             if let Some(foff) = field_offset(sname, member, &self.struct_layouts) {
                                 if foff != 0 { self.add_rm64_imm8(1, foff as i8); }
                             }
@@ -834,19 +929,41 @@ impl Generator {
                             self.mov_m64_r64(1, 0, 0);
                         }
                     }
+                    Expr::Unary { op: UnOp::Deref, operand } => {
+                        self.push_r64(0);
+                        self.compile_expr_addr(target, 1);
+                        self.pop_r64(0);
+                        let elem_size = if let Expr::Identifier(oname) = operand.as_ref() {
+                            if let Some(Type::Ptr(inner)) = self.var_types.get(oname) {
+                                type_size(inner, &self.struct_layouts)
+                            } else { 8 }
+                        } else { 8 };
+                        if elem_size == 1 {
+                            self.u8(0x88); self.modrm(0, 0, 1);
+                        } else if elem_size == 4 {
+                            self.mov_m32_r64(1, 0, 0);
+                        } else {
+                            self.mov_m64_r64(1, 0, 0);
+                        }
+                    }
                     _ => {
-                        // General case: compile_expr_addr to get target address in R1, store RAX
-                        self.push_r64(0); // save value
-                        self.compile_expr_addr(target, 1); // R1 = target address
-                        self.pop_r64(0); // restore value
+                        self.push_r64(0);
+                        self.compile_expr_addr(target, 1);
+                        self.pop_r64(0);
                         self.mov_m64_r64(1, 0, 0);
                     }
                 }
             }
             Expr::Member { object, member } => {
-                // Get ADDRESS of object, then load field at offset
-                self.compile_expr_addr(object, reg);
-                if let Some(sname) = resolve_struct_name(object, &self.var_types) {
+                // For pointer types, load the pointer value first; otherwise get address
+                let is_ptr = matches!(object.as_ref(), Expr::Identifier(oname)
+                    if self.var_types.get(oname).map_or(false, |t| matches!(t, Type::Ptr(_))));
+                if is_ptr {
+                    self.compile_expr_to(object, reg);
+                } else {
+                    self.compile_expr_addr(object, reg);
+                }
+                if let Some(sname) = resolve_struct_name(object, &self.var_types, &self.struct_layouts) {
                     if let Some(foff) = field_offset(sname, member, &self.struct_layouts) {
                         let fsz = field_size(sname, member, &self.struct_layouts).unwrap_or(8);
                         if fsz == 4 {
@@ -858,9 +975,14 @@ impl Generator {
                 }
             }
             Expr::Index { object, index } => {
+                let is_ptr = matches!(object.as_ref(), Expr::Identifier(oname)
+                    if self.var_types.get(oname).map_or(false, |t| matches!(t, Type::Ptr(_))));
                 let elem_size = get_ptr_elem_size(object, &self.var_types, &self.struct_layouts);
-                // Compute pointer value: for pointer vars, load value; for array vars, compile_to
-                self.compile_expr_to(object, 0);
+                if is_ptr {
+                    self.compile_expr_to(object, 0);
+                } else {
+                    self.compile_expr_addr(object, 0);
+                }
                 self.push_r64(0);
                 self.compile_expr_to(index, 1);
                 self.pop_r64(0);
@@ -869,10 +991,13 @@ impl Generator {
                     self.imul_r64(1, 2);
                 }
                 self.add_r64(0, 1);
+                if reg != 0 { self.mov_r64_r64(reg, 0); }
                 if elem_size == 1 {
-                    self.movzx_r64(reg, 0, 0);
+                    self.movzx_r64(reg, reg, 0);
+                } else if elem_size == 4 {
+                    self.mov_r64_m32(reg, reg, 0);
                 } else {
-                    self.mov_r64_m32(reg, 0, 0);
+                    self.mov_r64_m64(reg, reg, 0);
                 }
             }
             Expr::ArrayInit(elems) => {
@@ -880,12 +1005,17 @@ impl Generator {
                 let count = elems.len() as i32;
                 let bytes = count * 4;
                 if bytes > 0 {
-                    self.sub_rm64_imm8(4, bytes as i8);
+                    if bytes <= 127 {
+                        self.sub_rm64_imm8(4, bytes as i8);
+                    } else {
+                        self.mov_r64_imm32(1, bytes as u32);
+                        self.sub_r64(4, 1);
+                    }
                 }
-                self.mov_r64_r64(reg, 4); // return pointer to start of array
+                self.mov_r64_r64(reg, 4);
                 for (i, elem) in elems.iter().enumerate() {
                     self.compile_expr_to(elem, 0);
-                    self.mov_m64_r64(4, i as i32 * 4, 0);
+                    self.mov_m32_r64(4, i as i32 * 4, 0);
                 }
             }
             Expr::StructInit { type_name, fields } => {
@@ -897,15 +1027,21 @@ impl Generator {
                 self.mov_r64_r64(reg, 4);
                 for (fname, fval) in fields {
                     if let Some(foff) = field_offset(type_name, fname, &self.struct_layouts) {
-                        self.compile_expr_to(fval, 0);
-                        self.mov_m64_r64(4, foff, 0);
+                        if let Some(fsz) = field_size(type_name, fname, &self.struct_layouts) {
+                            self.compile_expr_to(fval, 0);
+                            if fsz == 4 {
+                                self.mov_m32_r64(4, foff, 0);
+                            } else {
+                                self.mov_m64_r64(4, foff, 0);
+                            }
+                        }
                     }
                 }
             }
             Expr::SizeOf(ty) => {
                 let sz = match ty {
                     Type::Named(name) => struct_size(name, &self.struct_layouts),
-                    _ => type_size(ty),
+                    _ => type_size(ty, &self.struct_layouts),
                 };
                 self.mov_r64_imm32(reg, sz as u32);
             }
@@ -931,6 +1067,38 @@ impl Generator {
         if callee == "malloc" { self.compile_malloc(args); return; }
         if callee == "free" { self.compile_free(args); return; }
         if callee == "cmdline" { self.compile_cmdline(args); return; }
+
+        // Math intrinsics (only if `eat math` used)
+        if self.has_math {
+            match callee {
+                "abs" => { self.compile_abs(args); return; }
+                "min" => { self.compile_min(args); return; }
+                "max" => { self.compile_max(args); return; }
+                "clamp" => { self.compile_clamp(args); return; }
+                "pow" => { self.compile_pow(args); return; }
+                "gcd" => { self.compile_gcd(args); return; }
+                "rand" => { self.compile_rand(args); return; }
+                "srand" => { self.compile_srand(args); return; }
+                _ => {}
+            }
+        }
+
+        // GDI intrinsics (only if `eat gdi` used)
+        if self.has_gdi {
+            match callee {
+                "window_create" => { self.compile_gdi_window_create(args); return; }
+                "get_dc" => { self.compile_gdi_get_dc(args); return; }
+                "create_buffer" => { self.compile_gdi_create_buffer(args); return; }
+                "delete_buffer" => { self.compile_gdi_delete_buffer(args); return; }
+                "set_pixel" => { self.compile_gdi_set_pixel(args); return; }
+                "bitblt" => { self.compile_gdi_bitblt(args); return; }
+                "present" => { self.compile_gdi_present(args); return; }
+                "poll_events" => { self.compile_gdi_poll_events(args); return; }
+                "key_down" => { self.compile_gdi_key_down(args); return; }
+                "sleep" => { self.compile_sleep(args); return; }
+                _ => {}
+            }
+        }
 
         self.sub_rm64_imm8(4, 0x28);
         let arg_regs = [1, 2, 8, 9];
@@ -1196,7 +1364,14 @@ impl Generator {
                     }
                 }
                 self.compile_expr_to(&args[0], 0);
-                self.emit_print_int(callee == "println");
+                // Check if the variable is of type fixed, use fixed-point printing
+                if matches!(self.var_types.get(name), Some(Type::Fixed)) {
+                    self.emit_print_fixed(callee == "println");
+                } else if matches!(self.var_types.get(name), Some(Type::UnInt)) {
+                    self.emit_print_unint(callee == "println");
+                } else {
+                    self.emit_print_int(callee == "println");
+                }
             },
             Expr::String(s) => {
                 let s = format!("{}{}", s, if callee == "println" { "\r\n" } else { "" });
@@ -1204,6 +1379,16 @@ impl Generator {
             },
             Expr::Integer(n) => {
                 let s = format!("{}{}", n, if callee == "println" { "\r\n" } else { "" });
+                self.emit_print_string(&s);
+            },
+            Expr::Fixed(n) => {
+                let int_part = *n >> 16;
+                let frac_raw = ((*n as u64) & 0xFFFF) * 100000 / 65536;
+                let s = if int_part < 0 && frac_raw > 0 {
+                    format!("-{}.{:05}{}", (-int_part), frac_raw, if callee == "println" { "\r\n" } else { "" })
+                } else {
+                    format!("{}.{:05}{}", int_part, frac_raw, if callee == "println" { "\r\n" } else { "" })
+                };
                 self.emit_print_string(&s);
             },
             Expr::Bool(b) => {
@@ -1250,22 +1435,23 @@ impl Generator {
         self.push_r64(3);   // RBX
         self.push_r64(7);   // RDI
 
-        // Allocate 32-byte buffer for decimal digits (max ~10 for 32-bit int)
-        self.sub_rm64_imm8(4, 32);
+        // Allocate 48-byte buffer for decimal digits (max 20 for 64-bit int)
+        self.sub_rm64_imm8(4, 48);
 
-        // lea r8, [rsp+32] — end of buffer, we write digits backwards
-        self.lea_r64(8, 4, 32);
+        // lea r8, [rsp+48] — end of buffer, we write digits backwards
+        self.lea_r64(8, 4, 48);
 
         // === itoa loop ===
         let loop_lbl = self.new_label();
         self.put_label(loop_lbl);
 
-        // xor edx, edx — clear high part for div
+        // xor rdx, rdx — clear high part for div
         self.xor_r64(2, 2);
-        // mov ecx, 10 — divisor
+        // mov ecx, 10 — divisor (zero-extends to RCX)
         self.mov_r64_imm32(1, 10);
-        // div ecx — unsigned divide EDX:EAX by ECX → EAX=quotient, EDX=remainder
-        self.u8(0xF7); self.u8(0xF1);        // F7 F1 = div ecx
+        // div rcx — unsigned divide RDX:RAX by RCX → RAX=quotient, RDX=remainder
+        self.rex(true, false, false, false);  // REX.W
+        self.u8(0xF7); self.u8(0xF1);         // F7 F1 = div rcx
         // add dl, '0' — convert digit to ASCII
         self.u8(0x80); self.u8(0xC2); self.u8(0x30);  // 80 C2 30
         // dec r8 — move write pointer backwards
@@ -1273,8 +1459,9 @@ impl Generator {
         // mov byte [r8], dl — store digit byte
         self.u8(0x41); self.u8(0x88); self.u8(0x10);  // 41 88 10 = mov [r8], dl
 
-        // test eax, eax
-        self.u8(0x85); self.u8(0xC0);        // 85 C0 = test eax,eax
+        // test rax, rax
+        self.rex(true, false, false, false);  // REX.W
+        self.u8(0x85); self.u8(0xC0);        // 85 C0 = test rax,rax
         // jnz loop
         self.jcc_rel32(CC_NE);
         self.add_label_fixup(self.asm.len() as u32 - 4, loop_lbl, true);
@@ -1282,8 +1469,8 @@ impl Generator {
         // === After loop: R8 = pointer to first digit ===
         self.mov_r64_r64(3, 8);    // RBX = string pointer
 
-        // Length = (RSP + 32) - RBX
-        self.lea_r64(0, 4, 32);    // RAX = RSP + 32
+        // Length = (RSP + 48) - RBX
+        self.lea_r64(0, 4, 48);    // RAX = RSP + 48
         self.sub_r64(0, 3);        // RAX -= RBX
         self.mov_r64_r64(7, 0);    // RDI = length
 
@@ -1317,7 +1504,7 @@ impl Generator {
         self.add_rm64_imm8(4, 0x38);
 
         // === Restore ===
-        self.add_rm64_imm8(4, 32);  // free buffer
+        self.add_rm64_imm8(4, 48);  // free buffer
         self.pop_r64(7);            // RDI
         self.pop_r64(3);            // RBX
     }
@@ -1374,15 +1561,381 @@ impl Generator {
         self.pop_r64(3);
     }
 
+    /// Print a fixed-point Q16.16 value (already in RAX).
+    fn emit_print_fixed(&mut self, add_newline: bool) {
+        self.emit_print_int(add_newline);
+    }
+
+    /// Print an unsigned negative value (already in RAX, stored as negative i32).
+    fn emit_print_unint(&mut self, add_newline: bool) {
+        self.emit_print_int(add_newline);
+    }
+
+    // --- Math intrinsics ---
+
+    fn compile_abs(&mut self, args: &[Expr]) {
+        if !args.is_empty() { self.compile_expr_to(&args[0], 0); } else { self.xor_r64(0, 0); return; }
+        // cdq (sign-extend eax → edx:eax)
+        self.u8(0x99);
+        // xor eax, edx; sub eax, edx  → absolute value
+        self.asm.extend_from_slice(&[0x31, 0xD0]); // xor eax, edx
+        self.asm.extend_from_slice(&[0x29, 0xD0]); // sub eax, edx
+    }
+
+    fn compile_min(&mut self, args: &[Expr]) {
+        if args.len() < 2 { self.xor_r64(0, 0); return; }
+        self.compile_expr_to(&args[0], 0);
+        self.compile_expr_to(&args[1], 1);
+        // cmp eax, ecx; cmovg eax, ecx
+        self.asm.extend_from_slice(&[0x39, 0xC8]); // cmp eax, ecx
+        self.asm.extend_from_slice(&[0x0F, 0x4F, 0xC1]); // cmovg eax, ecx
+    }
+
+    fn compile_max(&mut self, args: &[Expr]) {
+        if args.len() < 2 { self.xor_r64(0, 0); return; }
+        self.compile_expr_to(&args[0], 0);
+        self.compile_expr_to(&args[1], 1);
+        // cmp eax, ecx; cmovl eax, ecx
+        self.asm.extend_from_slice(&[0x39, 0xC8]); // cmp eax, ecx
+        self.asm.extend_from_slice(&[0x0F, 0x4C, 0xC1]); // cmovl eax, ecx
+    }
+
+    fn compile_clamp(&mut self, args: &[Expr]) {
+        if args.len() < 3 { self.xor_r64(0, 0); return; }
+        self.compile_expr_to(&args[0], 0);
+        self.compile_expr_to(&args[1], 1);
+        self.compile_expr_to(&args[2], 8);
+        // cmp eax, ecx; cmovl eax, ecx (max with lo)
+        self.asm.extend_from_slice(&[0x39, 0xC8]); // cmp eax, ecx
+        self.asm.extend_from_slice(&[0x0F, 0x4C, 0xC1]); // cmovl eax, ecx
+        // cmp eax, r8d; cmovg eax, r8d (min with hi)
+        self.asm.extend_from_slice(&[0x44, 0x39, 0xC0]); // cmp eax, r8d
+        self.asm.extend_from_slice(&[0x41, 0x0F, 0x4F, 0xC0]); // cmovg eax, r8d
+    }
+
+    fn compile_pow(&mut self, args: &[Expr]) {
+        if args.len() < 2 { self.xor_r64(0, 0); return; }
+        self.compile_expr_to(&args[0], 0); // base in RAX
+        self.compile_expr_to(&args[1], 1); // exp in RCX
+        // if exp <= 0, result = 1
+        let done_lbl = self.new_label();
+        // mov edx, 1 (result)
+        self.asm.extend_from_slice(&[0xBA, 0x01, 0x00, 0x00, 0x00]);
+        // test ecx, ecx; jle done
+        self.u8(0x85); self.modrm(3, 1, 1); // test ecx, ecx
+        self.jcc_rel32(CC_LE);
+        self.add_label_fixup(self.asm.len() as u32 - 4, done_lbl, true);
+        let loop_lbl = self.new_label();
+        self.put_label(loop_lbl);
+        // imul edx, eax (result *= base, 32-bit)
+        self.asm.extend_from_slice(&[0x0F, 0xAF, 0xD0]); // imul edx, eax
+        // dec ecx; jnz loop
+        self.u8(0xFF); self.u8(0xC9); // dec ecx
+        self.jcc_rel32(CC_NE);
+        self.add_label_fixup(self.asm.len() as u32 - 4, loop_lbl, true);
+        self.put_label(done_lbl);
+        self.mov_r64_r64(0, 2); // result → RAX
+    }
+
+    fn compile_gcd(&mut self, args: &[Expr]) {
+        if args.len() < 2 { self.xor_r64(0, 0); return; }
+        self.compile_expr_to(&args[0], 0); // a in RAX
+        self.compile_expr_to(&args[1], 1); // b in RCX
+        let loop_lbl = self.new_label();
+        let done_lbl = self.new_label();
+        self.put_label(loop_lbl);
+        // test ecx, ecx; je done
+        self.u8(0x85); self.modrm(3, 1, 1); // test ecx, ecx
+        self.jcc_rel32(CC_E);
+        self.add_label_fixup(self.asm.len() as u32 - 4, done_lbl, true);
+        // xor edx, edx; idiv ecx (edx = a % b)
+        self.asm.extend_from_slice(&[0x31, 0xD2]); // xor edx, edx
+        self.asm.extend_from_slice(&[0xF7, 0xF9]); // idiv ecx
+        // mov eax, ecx (a = b); mov ecx, edx (b = remainder)
+        self.asm.extend_from_slice(&[0x89, 0xC8]); // mov eax, ecx
+        self.asm.extend_from_slice(&[0x89, 0xD1]); // mov ecx, edx
+        // jmp loop
+        self.jmp_rel32();
+        self.add_label_fixup(self.asm.len() as u32 - 4, loop_lbl, true);
+        self.put_label(done_lbl);
+        // result in eax
+    }
+
+    fn compile_rand(&mut self, _args: &[Expr]) {
+        // rand() → call msvcrt!rand, returns int in eax
+        // RSP ≡ 0 mod 16 at this point (after prologue), need 0x30 (32 shadow + 16 alignment)
+        self.sub_rm64_imm8(4, 0x30);
+        let offset = self.asm.len() as u32;
+        self.call_rip_placeholder();
+        self.import_relocs.push((offset, "rand".to_string()));
+        if !self.imports.iter().any(|i| i.name == "rand") {
+            self.imports.push(ImportRequest {
+                name: "rand".to_string(),
+                dll: "msvcrt.dll".to_string(),
+            });
+        }
+        self.add_rm64_imm8(4, 0x30);
+    }
+
+    fn compile_srand(&mut self, args: &[Expr]) {
+        // srand(seed) → call msvcrt!srand
+        if !args.is_empty() { self.compile_expr_to(&args[0], 0); } // seed to RAX
+        self.sub_rm64_imm8(4, 0x30);
+        if !args.is_empty() { self.mov_r64_r64(1, 0); } // RCX = seed
+        let offset = self.asm.len() as u32;
+        self.call_rip_placeholder();
+        self.import_relocs.push((offset, "srand".to_string()));
+        if !self.imports.iter().any(|i| i.name == "srand") {
+            self.imports.push(ImportRequest {
+                name: "srand".to_string(),
+                dll: "msvcrt.dll".to_string(),
+            });
+        }
+        self.add_rm64_imm8(4, 0x30);
+    }
+
+    // ── GDI intrinsics ──
+
+    fn register_gdi_imports(&mut self) {
+        for name in &["CreateWindowExA", "GetAsyncKeyState", "GetModuleHandleA",
+            "PeekMessageA", "TranslateMessage", "DispatchMessageA",
+            "ShowWindow", "GetDC", "ReleaseDC", "DestroyWindow"] {
+            let dll = "user32.dll";
+            if !self.imports.iter().any(|i| i.name == *name) {
+                self.imports.push(ImportRequest { name: name.to_string(), dll: dll.to_string() });
+            }
+        }
+        for name in &["SetPixel", "BitBlt", "CreateCompatibleDC", "CreateCompatibleBitmap",
+            "SelectObject", "DeleteObject", "DeleteDC"] {
+            let dll = "gdi32.dll";
+            if !self.imports.iter().any(|i| i.name == *name) {
+                self.imports.push(ImportRequest { name: name.to_string(), dll: dll.to_string() });
+            }
+        }
+    }
+
+    fn compile_gdi_window_create(&mut self, args: &[Expr]) {
+        // window_create(title, w, h) → HWND via CreateWindowExA("STATIC", ...)
+        let cls_idx = self.intern_string("STATIC");
+        let title_str = match args.get(0) {
+            Some(Expr::String(s)) => s.clone(),
+            _ => "Game".to_string(),
+        };
+        let title_idx = self.intern_string(&title_str);
+
+        self.sub_rm64_imm8(4, 0x28);
+        self.xor_r64(1, 1);
+        self.emit_dll_import_call("GetModuleHandleA", "kernel32.dll");
+        self.add_rm64_imm8(4, 0x28);
+        self.mov_r64_r64(3, 0);
+
+        self.sub_rm64_imm8(4, 0x68);
+        self.xor_r64(1, 1);
+        let cls_off = self.asm.len() as u32;
+        self.lea_r64_rip(2);
+        self.string_relocs.push((cls_off, cls_idx));
+        let title_off = self.asm.len() as u32;
+        self.lea_r64_rip(8);
+        self.string_relocs.push((title_off, title_idx));
+        self.mov_r64_imm32(9, 0x10CF0000);
+        self.mov_m64_imm32(4, 0x28, i32::MIN); // CW_USEDEFAULT = 0x80000000
+        self.mov_m64_imm32(4, 0x30, i32::MIN);
+        let w = match args.get(1) { Some(Expr::Integer(n)) => *n as i32, _ => 800 };
+        let h = match args.get(2) { Some(Expr::Integer(n)) => *n as i32, _ => 600 };
+        self.mov_m64_imm32(4, 0x38, w);
+        self.mov_m64_imm32(4, 0x40, h);
+        self.mov_m64_imm32(4, 0x48, 0);
+        self.mov_m64_imm32(4, 0x50, 0);
+        self.mov_m64_r64(4, 0x58, 3);
+        self.mov_m64_imm32(4, 0x60, 0);
+        self.emit_dll_import_call("CreateWindowExA", "user32.dll");
+        self.add_rm64_imm8(4, 0x68);
+
+        // ShowWindow(hwnd, SW_SHOWNORMAL)
+        self.push_r64(3);
+        self.mov_r64_r64(3, 0);
+        self.sub_rm64_imm8(4, 0x28);
+        self.mov_r64_r64(1, 3);
+        self.mov_r64_imm32(2, 1);
+        self.emit_dll_import_call("ShowWindow", "user32.dll");
+        self.add_rm64_imm8(4, 0x28);
+        self.mov_r64_r64(0, 3);
+        self.pop_r64(3);
+    }
+
+    fn compile_gdi_get_dc(&mut self, args: &[Expr]) {
+        self.sub_rm64_imm8(4, 0x28);
+        if !args.is_empty() { self.compile_expr_to(&args[0], 1); }
+        else { self.xor_r64(1, 1); }
+        self.emit_dll_import_call("GetDC", "user32.dll");
+        self.add_rm64_imm8(4, 0x28);
+    }
+
+    fn compile_gdi_create_buffer(&mut self, args: &[Expr]) {
+        // create_buffer(desk_dc, w, h) → returns memory DC in RAX
+        // Internally: CreateCompatibleDC(NULL) + CreateCompatibleBitmap(desk_dc, w, h) + SelectObject
+        // Step 1: CreateCompatibleDC(NULL) → mem_dc
+        self.sub_rm64_imm8(4, 0x28);
+        self.xor_r64(1, 1);
+        self.emit_dll_import_call("CreateCompatibleDC", "gdi32.dll");
+        self.add_rm64_imm8(4, 0x28);
+        self.push_r64(3); // save mem_dc in RBX
+        self.mov_r64_r64(3, 0);
+
+        // Step 2: CreateCompatibleBitmap(desk_dc, w, h) → bitmap
+        self.sub_rm64_imm8(4, 0x28);
+        if !args.is_empty() { self.compile_expr_to(&args[0], 1); } // RCX = desk_dc
+        self.compile_expr_to(args.get(1).unwrap_or(&Expr::Integer(0)), 2); // RDX = w
+        self.compile_expr_to(args.get(2).unwrap_or(&Expr::Integer(0)), 8); // R8 = h
+        self.emit_dll_import_call("CreateCompatibleBitmap", "gdi32.dll");
+        self.add_rm64_imm8(4, 0x28);
+
+        // Step 3: SelectObject(mem_dc, bitmap)
+        self.sub_rm64_imm8(4, 0x28);
+        self.mov_r64_r64(1, 3); // RCX = mem_dc
+        self.mov_r64_r64(2, 0); // RDX = bitmap handle
+        self.emit_dll_import_call("SelectObject", "gdi32.dll");
+        self.add_rm64_imm8(4, 0x28);
+
+        // Return mem_dc in RAX
+        self.mov_r64_r64(0, 3);
+        self.pop_r64(3);
+    }
+
+    fn compile_gdi_delete_buffer(&mut self, args: &[Expr]) {
+        self.sub_rm64_imm8(4, 0x28);
+        if !args.is_empty() { self.compile_expr_to(&args[0], 1); }
+        self.emit_dll_import_call("DeleteDC", "gdi32.dll");
+        self.add_rm64_imm8(4, 0x28);
+    }
+
+    fn compile_gdi_set_pixel(&mut self, args: &[Expr]) {
+        self.sub_rm64_imm8(4, 0x28);
+        if args.len() > 0 { self.compile_expr_to(&args[0], 1); }
+        if args.len() > 1 { self.compile_expr_to(&args[1], 2); }
+        if args.len() > 2 { self.compile_expr_to(&args[2], 8); }
+        if args.len() > 3 { self.compile_expr_to(&args[3], 9); }
+        self.emit_dll_import_call("SetPixel", "gdi32.dll");
+        self.add_rm64_imm8(4, 0x28);
+    }
+
+    fn compile_gdi_bitblt(&mut self, args: &[Expr]) {
+        self.sub_rm64_imm8(4, 0x48);
+        if args.len() > 0 { self.compile_expr_to(&args[0], 1); }
+        if args.len() > 1 { self.compile_expr_to(&args[1], 2); }
+        if args.len() > 2 { self.compile_expr_to(&args[2], 8); }
+        if args.len() > 3 { self.compile_expr_to(&args[3], 9); }
+        if args.len() > 4 { self.compile_expr_to(&args[4], 0); self.mov_m64_r64(4, 0x28, 0); }
+        else { self.mov_m64_imm32(4, 0x28, 0); }
+        if args.len() > 5 { self.compile_expr_to(&args[5], 0); self.mov_m64_r64(4, 0x30, 0); }
+        else { self.mov_m64_imm32(4, 0x30, 0); }
+        self.mov_m64_imm32(4, 0x38, 0);
+        self.mov_m64_imm32(4, 0x40, 0);
+        self.mov_m64_imm32(4, 0x48, 0x00CC0020);
+        self.emit_dll_import_call("BitBlt", "gdi32.dll");
+        self.add_rm64_imm8(4, 0x48);
+    }
+
+    fn compile_gdi_present(&mut self, args: &[Expr]) {
+        // present(dst, src, w, h) → BitBlt(dst, 0, 0, w, h, src, 0, 0, SRCCOPY)
+        self.sub_rm64_imm8(4, 0x48);
+        if args.len() > 0 { self.compile_expr_to(&args[0], 1); } else { self.xor_r64(1, 1); } // RCX = dst
+        self.xor_r64(2, 2); // RDX = dx = 0
+        self.xor_r64(8, 8); // R8 = dy = 0
+        if args.len() > 2 { self.compile_expr_to(&args[2], 9); } // R9 = w
+        if args.len() > 3 { self.compile_expr_to(&args[3], 0); self.mov_m64_r64(4, 0x28, 0); } // h
+        else { self.mov_m64_imm32(4, 0x28, 0); }
+        if args.len() > 1 { self.compile_expr_to(&args[1], 0); self.mov_m64_r64(4, 0x30, 0); } // src
+        else { self.mov_m64_imm32(4, 0x30, 0); }
+        self.mov_m64_imm32(4, 0x38, 0); // sx = 0
+        self.mov_m64_imm32(4, 0x40, 0); // sy = 0
+        self.mov_m64_imm32(4, 0x48, 0x00CC0020); // SRCCOPY
+        self.emit_dll_import_call("BitBlt", "gdi32.dll");
+        self.add_rm64_imm8(4, 0x48);
+    }
+
+    fn compile_gdi_poll_events(&mut self, args: &[Expr]) {
+        // allocate stack: 0x28 shadow + 0x40 for MSG (40 bytes rounded up)
+        self.sub_rm64_imm8(4, 0x68);
+
+        // PeekMessage loop — consume all pending messages
+        let peek_loop = self.new_label();
+        self.put_label(peek_loop);
+        self.lea_r64(1, 4, 0x28);
+        self.xor_r64(2, 2);
+        self.xor_r64(8, 8);
+        self.xor_r64(9, 9);
+        self.mov_m64_imm32(4, 0x20, 1);
+        self.emit_dll_import_call("PeekMessageA", "user32.dll");
+        self.u8(0x85); self.u8(0xC0);
+        let peek_done = self.new_label();
+        self.jcc_rel32(CC_E);
+        self.add_label_fixup(self.asm.len() as u32 - 4, peek_done, true);
+        self.lea_r64(1, 4, 0x28);
+        self.emit_dll_import_call("TranslateMessage", "user32.dll");
+        self.lea_r64(1, 4, 0x28);
+        self.emit_dll_import_call("DispatchMessageA", "user32.dll");
+        self.jmp_rel32();
+        self.add_label_fixup(self.asm.len() as u32 - 4, peek_loop, true);
+
+        // All messages processed — check ESC key
+        self.put_label(peek_done);
+        self.mov_r64_imm32(1, 27);
+        self.emit_dll_import_call("GetAsyncKeyState", "user32.dll");
+        self.u8(0x66); self.u8(0x85); self.u8(0xC0);
+        let done = self.new_label();
+        self.jcc_rel32(CC_GE);
+        self.add_label_fixup(self.asm.len() as u32 - 4, done, true);
+        // ESC pressed → leave -1 in RAX
+        self.mov_r64_imm32(0, -1i32 as u32);
+        let skip = self.new_label();
+        self.jmp_rel32();
+        self.add_label_fixup(self.asm.len() as u32 - 4, skip, true);
+        self.put_label(done);
+        self.xor_r64(0, 0); // 0 in RAX
+        self.put_label(skip);
+        self.add_rm64_imm8(4, 0x68);
+    }
+
+    fn compile_gdi_key_down(&mut self, args: &[Expr]) {
+        // key_down(vkey) → GetAsyncKeyState → returns 1 if high bit set
+        self.sub_rm64_imm8(4, 0x28);
+        if !args.is_empty() { self.compile_expr_to(&args[0], 1); }
+        self.emit_dll_import_call("GetAsyncKeyState", "user32.dll");
+        self.add_rm64_imm8(4, 0x28);
+        self.u8(0x66); self.u8(0x85); self.u8(0xC0); // test ax, ax
+        let not_down = self.new_label();
+        self.jcc_rel32(CC_GE);
+        self.add_label_fixup(self.asm.len() as u32 - 4, not_down, true);
+        self.mov_r64_imm32(0, 1);
+        let done = self.new_label();
+        self.jmp_rel32();
+        self.add_label_fixup(self.asm.len() as u32 - 4, done, true);
+        self.put_label(not_down);
+        self.xor_r64(0, 0);
+        self.put_label(done);
+    }
+
+    fn compile_sleep(&mut self, args: &[Expr]) {
+        self.sub_rm64_imm8(4, 0x28);
+        if !args.is_empty() { self.compile_expr_to(&args[0], 1); }
+        self.emit_import_call("Sleep");
+        self.add_rm64_imm8(4, 0x28);
+    }
+
     fn emit_import_call(&mut self, name: &str) {
+        self.emit_dll_import_call(name, "kernel32.dll");
+    }
+
+    fn emit_dll_import_call(&mut self, name: &str, dll: &str) {
         let offset = self.asm.len() as u32;
         self.call_rip_placeholder();
         self.import_relocs.push((offset, name.to_string()));
         // Track import
-        if !self.imports.iter().any(|i| i.name == name) {
+        if !self.imports.iter().any(|i| i.name == name && i.dll == dll) {
             self.imports.push(ImportRequest {
                 name: name.to_string(),
-                dll: "kernel32.dll".to_string(),
+                dll: dll.to_string(),
             });
         }
     }

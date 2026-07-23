@@ -6,6 +6,9 @@ pub enum Type {
     Char,
     Bool,
     Void,
+    UpInt,
+    UnInt,
+    Fixed,
     Ptr(Box<Type>),
     Array(Box<Type>),            // int[] — dynamic array
     StaticArray(Box<Type>, usize), // int[10] — static array (fixed size)
@@ -46,6 +49,7 @@ pub enum Stmt {
 #[derive(Debug, Clone)]
 pub enum Expr {
     Integer(i64),
+    Fixed(i64),  // Q16.16 fixed-point
     String(String),
     Char(u8),
     Bool(bool),
@@ -133,6 +137,7 @@ pub struct StructDefinition {
 pub struct Program {
     pub functions: Vec<Function>,
     pub structs: Vec<StructDefinition>,
+    pub imports: Vec<String>,
 }
 
 impl fmt::Display for Type {
@@ -142,6 +147,9 @@ impl fmt::Display for Type {
             Type::Char => write!(f, "char"),
             Type::Bool => write!(f, "bool"),
             Type::Void => write!(f, "void"),
+            Type::UpInt => write!(f, "upint"),
+            Type::UnInt => write!(f, "unint"),
+            Type::Fixed => write!(f, "fixed"),
             Type::Ptr(t) => write!(f, "*{}", t),
             Type::Array(t) => write!(f, "[]{}", t),
             Type::StaticArray(t, n) => write!(f, "[{}]{}", n, t),
@@ -152,6 +160,6 @@ impl fmt::Display for Type {
 
 impl Program {
     pub fn new() -> Self {
-        Program { functions: Vec::new(), structs: Vec::new() }
+        Program { functions: Vec::new(), structs: Vec::new(), imports: Vec::new() }
     }
 }

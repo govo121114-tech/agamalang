@@ -1,0 +1,26 @@
+eat gdi
+
+fn main() {
+    let hwnd: int = window_create("Game", 640, 480);
+    let buf: int = create_buffer(hwnd, 640, 480);
+
+    let y: int = 0;
+    while (y < 480) {
+        let x: int = 0;
+        while (x < 640) {
+            set_pixel(buf, x, y, 0x0000FF);
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+
+    let running: int = 1;
+    while (running != 0) {
+        present(hwnd, buf, 640, 480);
+        if (poll_events() != 0) {
+            running = 0;
+        }
+    }
+
+    delete_buffer(buf);
+}

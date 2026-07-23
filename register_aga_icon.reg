@@ -1,0 +1,16 @@
+Windows Registry Editor Version 5.00
+
+; Register .aga file extension with AgamaLang logo icon
+; Double-click this file to apply (Run as Administrator for system-wide, or normal for current user)
+
+[HKEY_CURRENT_USER\SOFTWARE\Classes\.aga]
+@="AgamaLang.File"
+
+[HKEY_CURRENT_USER\SOFTWARE\Classes\AgamaLang.File]
+@="AgamaLang Source File"
+
+[HKEY_CURRENT_USER\SOFTWARE\Classes\AgamaLang.File\DefaultIcon]
+@="C:\\Users\\I\\Documents\\ai\\agamalang\\logo_of_Agamalang.ico"
+
+[HKEY_CURRENT_USER\SOFTWARE\Classes\AgamaLang.File\shell\open\command]
+@="\"C:\\Users\\I\\.cargo\\bin\\cargo.exe\" run -- \"%1\""

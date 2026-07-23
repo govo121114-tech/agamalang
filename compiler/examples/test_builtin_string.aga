@@ -1,0 +1,51 @@
+// AgamaLang Builtin String Test
+// Tests: str_eq, str_len, str_to_int with edge cases
+
+fn main() {
+    // === str_len ===
+    if (str_len("") == 0) { println("PASS: str_len empty"); }
+    if (str_len("a") == 1) { println("PASS: str_len single char"); }
+    if (str_len("hello") == 5) { println("PASS: str_len hello"); }
+    if (str_len("hello\nworld") == 11) { println("PASS: str_len with newline"); }
+
+    // === str_eq ===
+    if (str_eq("", "") == 1) { println("PASS: str_eq empty strings"); }
+    if (str_eq("abc", "abc") == 1) { println("PASS: str_eq equal"); }
+    if (str_eq("abc", "abd") == 0) { println("PASS: str_eq different last char"); }
+    if (str_eq("abc", "abcd") == 0) { println("PASS: str_eq diff length"); }
+    if (str_eq("abcd", "abc") == 0) { println("PASS: str_eq diff length 2"); }
+    if (str_eq("", "a") == 0) { println("PASS: str_eq empty vs non-empty"); }
+    if (str_eq("A", "a") == 0) { println("PASS: str_eq case sensitive"); }
+    if (str_eq("hello world", "hello world") == 1) { println("PASS: str_eq long string"); }
+
+    // === str_to_int ===
+    let n0: int = str_to_int("0");
+    if (n0 == 0) { println("PASS: str_to_int zero"); }
+
+    let n1: int = str_to_int("123");
+    if (n1 == 123) { println("PASS: str_to_int 123"); }
+
+    let n2: int = str_to_int("99999");
+    if (n2 == 99999) { println("PASS: str_to_int 99999"); }
+
+    let n3: int = str_to_int("1");
+    if (n3 == 1) { println("PASS: str_to_int single digit"); }
+
+    // Edge case: non-numeric (stops at first non-digit)
+    let n4: int = str_to_int("42abc");
+    if (n4 == 42) { println("PASS: str_to_int stops at non-digit"); }
+
+    let n5: int = str_to_int("");
+    if (n5 == 0) { println("PASS: str_to_int empty string"); }
+
+    // === malloc/free (also use strings) ===
+    let s: *char = malloc(100);
+    s[0] = 72;  // 'H'
+    s[1] = 105; // 'i'
+    s[2] = 0;   // null terminator
+    if (s[0] == 72) { println("PASS: malloc string write"); }
+    if (s[1] == 105) { println("PASS: malloc string write 2"); }
+    free(s);
+
+    println("PASS: all builtin string tests");
+}
